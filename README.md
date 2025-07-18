@@ -5,6 +5,7 @@ This repository contains a full pipeline for simulating motor faults, generating
 
 ## 📁 Project Structure
 
+```plaintext
 transformer_fault_diagnosis/
 │
 ├── data/                                       # Data storage
