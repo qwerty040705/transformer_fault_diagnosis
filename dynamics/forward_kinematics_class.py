@@ -1,7 +1,6 @@
 import numpy as np
 from scipy.linalg import block_diag
-from math import cos, sin
-from ..math.Adinv import Adinv  # 반드시 별도로 구현되어 있어야 합니다.
+from project_math.Adinv import Adinv
 
 class ForwardKinematics:
     def __init__(self, param):
@@ -105,15 +104,15 @@ class ForwardKinematics:
 
     def rotx(self, theta):
         return np.array([[1, 0, 0],
-                         [0, cos(theta), -sin(theta)],
-                         [0, sin(theta), cos(theta)]])
+                         [0, np.cos(theta), -np.sin(theta)],
+                         [0, np.sin(theta), np.cos(theta)]])
 
     def roty(self, theta):
-        return np.array([[cos(theta), 0, sin(theta)],
+        return np.array([[np.cos(theta), 0, np.sin(theta)],
                          [0, 1, 0],
-                         [-sin(theta), 0, cos(theta)]])
+                         [-np.sin(theta), 0, np.cos(theta)]])
 
     def rotz(self, theta):
-        return np.array([[cos(theta), -sin(theta), 0],
-                         [sin(theta), cos(theta), 0],
+        return np.array([[np.cos(theta), -np.sin(theta), 0],
+                         [np.sin(theta),  np.cos(theta), 0],
                          [0, 0, 1]])

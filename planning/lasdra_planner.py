@@ -3,10 +3,10 @@
 import numpy as np
 from scipy.linalg import logm
 from math import pi, cos, sin
-from ..math.Tinv import Tinv
-from ..math.getLogisticSigmoidPosition import getLogisticSigmoidPosition
-from ..planning.closed_loop_inverse_kinematics import ClosedLoopInverseKinematics
-from ..dynamics.forward_kinematics_class import ForwardKinematics  # Needed for CLIK
+from project_math.Tinv import Tinv
+from project_math.getLogisticSigmoidPosition import getLogisticSigmoidPosition
+from planning.closed_loop_inverse_kinematics import ClosedLoopInverseKinematics
+from dynamics.forward_kinematics_class import ForwardKinematics  # Needed for CLIK
 from scipy.spatial.transform import Rotation as R
 
 class LasdraPlanner:

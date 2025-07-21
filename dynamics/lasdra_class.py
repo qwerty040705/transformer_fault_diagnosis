@@ -2,9 +2,9 @@
 
 import numpy as np
 from scipy.linalg import block_diag, sqrtm, solve_sylvester
-from ..math.Adinv import Adinv
-from ..math.adj import adj
-from ..math.Tinv import Tinv
+from project_math.Adinv import Adinv
+from project_math.adj import adj
+from project_math.Tinv import Tinv
 from .forward_kinematics_class import ForwardKinematics
 
 class LASDRA:

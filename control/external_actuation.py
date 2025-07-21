@@ -3,7 +3,7 @@
 import numpy as np
 from scipy.sparse import block_diag
 from scipy.optimize import linprog, minimize
-from selective_mapping import SelectiveMapping
+from control.selective_mapping import SelectiveMapping
 
 class ExternalActuation:
     def __init__(self, params_model, lasdra_model):

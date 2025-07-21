@@ -1,5 +1,5 @@
 import numpy as np
-from .skew import skew  # 같은 폴더 내 skew.py에서 skew 함수 import
+from .skew import skew 
 
 def Ad(T):
     """

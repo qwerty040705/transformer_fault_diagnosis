@@ -1,7 +1,7 @@
 # closed_loop_inverse_kinematics.py
 
 import numpy as np
-from ..dynamics.forward_kinematics_class import ForwardKinematics
+from dynamics.forward_kinematics_class import ForwardKinematics
 
 class ClosedLoopInverseKinematics:
     def __init__(self, param):
