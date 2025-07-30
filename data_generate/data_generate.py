@@ -5,7 +5,7 @@
 import os
 import numpy as np
 
-from planning.closed_loop_inverse_kinematics import generate_desired_trajectory
+from planning.closed_loop_inverse_kinematics import ClosedLoopInverseKinematics
 from dynamics.forward_kinematics_class import ForwardKinematics
 from dynamics.lasdra_class import LASDRA
 from fault_injection import inject_faults
