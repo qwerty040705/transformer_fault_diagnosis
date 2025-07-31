@@ -1,5 +1,4 @@
-# external_actuation.py
-
+# control/external_actuation.py
 import numpy as np
 from scipy.sparse import block_diag
 from scipy.optimize import linprog, minimize
@@ -21,7 +20,7 @@ class ExternalActuation:
                              [np.eye(3), np.zeros((3, 3))]])
         B_blocks = []
         for odar in params_model["ODAR"]:
-            B_blocks.append(eye_perm @ odar["B"])
+            B_blocks.append(eye_perm @ odar.B)
         return block_diag(B_blocks).toarray()
 
     def _init_lp_variables(self, params_model):
@@ -50,7 +49,7 @@ class ExternalActuation:
     def _generate_thrust_bounds(self, params_model):
         ub = []
         for odar in params_model["ODAR"]:
-            ub.extend([odar["max_thrust"]] * odar["B"].shape[1])
+            ub.extend([odar.max_thrust] * odar.B.shape[1])
         return np.array(ub)
 
     def distribute_torque_lp(self, torque):
