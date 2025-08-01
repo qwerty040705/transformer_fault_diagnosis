@@ -14,13 +14,16 @@ from planning.closed_loop_inverse_kinematics import ClosedLoopInverseKinematics
 from fault_injection import inject_faults
 from parameters import get_parameters
 from parameters_model import parameters_model
+from scipy.spatial.transform import Rotation as R
 
 
+# ----------------------------
+# 유틸: 출력 억제 / 진행률
+# ----------------------------
 def _quiet_call(func, *args, **kwargs):
     """stdout/stderr를 잠시 막고 함수 호출 (내부 print 억제)."""
     with io.StringIO() as buf, contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         return func(*args, **kwargs)
-
 
 def _progress_bar(idx, total, prefix="Generating"):
     """간단한 진행률 바 (한 줄 업데이트)."""
@@ -30,141 +33,260 @@ def _progress_bar(idx, total, prefix="Generating"):
     bar = "#" * filled + "-" * (bar_len - filled)
     print(f"\r{prefix} [{bar}] {frac*100:5.1f}% ({idx+1}/{total})", end="", flush=True)
     if idx + 1 == total:
-        print()  # 마지막엔 줄바꿈
+        print()
 
 
-def generate_random_trajectory(link_count, T=200, fault_time=100, epsilon_scale=0.05):
+# ----------------------------
+# IK 래퍼 (레포 시그니처 차이를 흡수)
+# ----------------------------
+def solve_ik(ik_solver, T_target, q_init):
+    """
+    ClosedLoopInverseKinematics의 반환 형식/메서드명을 유연 처리.
+    우선: solve(T_target, q_init) → ndarray or dict({'q': ...})
+    """
+    if hasattr(ik_solver, "solve"):
+        sol = ik_solver.solve(T_target, q_init)
+    else:
+        # FALLBACK: 메서드명이 다르면 아래에 맞게 수정
+        # sol = ik_solver.run(T_target, q_init)
+        raise AttributeError("ClosedLoopInverseKinematics has no method 'solve'")
+
+    # 반환이 dict인 경우
+    if isinstance(sol, dict):
+        if "q" in sol:
+            q = sol["q"]
+        elif "q_des" in sol:
+            q = sol["q_des"]
+        else:
+            raise ValueError("IK returned dict without 'q' key.")
+    else:
+        q = sol
+
+    q = np.asarray(q).reshape(-1, 1)
+    return q
+
+
+# ----------------------------
+# 임의 SE(3) 경로 생성 (T개)
+# ----------------------------
+def generate_random_se3_series(fk_solver, q0, link_count, link_length, T=200,
+                               max_pos_step=0.001, max_rot_step=0.001):
+    """
+    무작위지만 제약을 만족하는 부드러운 SE(3) 시계열 생성.
+    - 시작은 q0에서의 FK pose
+    - 매 스텝: 작은 임의 위치/자세 증분 (라디안/미터)
+    제약:
+      z ∈ [-1, 3]
+      sqrt(x^2 + y^2) < link_length * link_count
+    Orientation: 전 범위, 단 스텝은 작은 랜덤 회전 누적으로 부드럽게
+    Args:
+        max_pos_step: 스텝당 최대 위치 변화 (m)
+        max_rot_step: 스텝당 최대 회전 변화 (rad)
+    """
+    T0 = fk_solver.compute_end_effector_frame(q0.reshape(-1))
+    R_cur = R.from_matrix(T0[:3, :3])
+    p_cur = T0[:3, 3].copy()
+    T_series = [T0]
+
+    r_max = link_count * float(link_length)
+
+    for _ in range(1, T):
+        for _try in range(10):
+            # 1) 위치 증분
+            dp = np.random.uniform(-max_pos_step, max_pos_step, size=3)
+            p_cand = p_cur + dp
+
+            # 2) 제약 보정
+            if not (-0.5 <= p_cand[2] <= 1.0):
+                dp[2] *= 0.3
+                p_cand = p_cur + dp
+            if np.hypot(p_cand[0], p_cand[1]) > r_max:
+                dp[:2] *= 0.3
+                p_cand = p_cur + dp
+
+            # 3) 회전 증분 (라디안)
+            axis = np.random.randn(3)
+            n = np.linalg.norm(axis)
+            if n < 1e-12:
+                axis = np.array([1.0, 0.0, 0.0])
+            else:
+                axis = axis / n
+            angle = np.random.uniform(-max_rot_step, max_rot_step)
+            R_step = R.from_rotvec(axis * angle)
+
+            R_new = R_cur * R_step
+            T_new = np.eye(4)
+            T_new[:3, :3] = R_new.as_matrix()
+            T_new[:3, 3] = p_cand
+
+            # 유효 값이면 채택
+            if not np.any(np.isnan(T_new)) and not np.any(np.isinf(T_new)):
+                T_series.append(T_new)
+                R_cur = R_new
+                p_cur = p_cand
+                break
+        else:
+            # 10회 실패 → 이전 포즈 유지
+            T_series.append(T_series[-1].copy())
+
+    return T_series
+
+
+# ----------------------------
+# 한 샘플 생성
+# ----------------------------
+def generate_one_sample(link_count, T=200, fault_time=100, epsilon_scale=0.05, dt=0.01):
+    # 1) 파라미터 로드 및 집계
     base_param = get_parameters()
     base_param['LASDRA']['total_link_number'] = link_count
     base_param['ODAR'] = base_param['ODAR'][:link_count]
 
-    screw_axes_all = []
-    inertia_all = []
+    screw_axes_all, inertia_all = [], []
     for odar in base_param['ODAR']:
-        # ODAR는 객체 속성 접근
-        screw_axes_all.extend(odar.body_joint_screw_axes)
-        inertia_all.extend(odar.joint_inertia_tensor)
+        screw_axes_all.extend(odar.body_joint_screw_axes)   # (6,) 리스트
+        inertia_all.extend(odar.joint_inertia_tensor)       # 6x6 리스트
     base_param['LASDRA']['body_joint_screw_axes'] = screw_axes_all
     base_param['LASDRA']['inertia_matrix'] = inertia_all
     base_param['LASDRA']['dof'] = len(screw_axes_all)
 
-    # 내부 print 억제하여 모델 파라미터 로드
+    # 이상적 모델 파라미터 (mode=0)
     model_param = _quiet_call(parameters_model, mode=0, params_prev=base_param)
 
+    # 로봇/기구학/IK 객체
     robot = LASDRA(model_param)
     fk_solver = ForwardKinematics(model_param)
-    ik_solver = ClosedLoopInverseKinematics(model_param)  # (현재 예제에서는 사용 X)
+    ik_solver = ClosedLoopInverseKinematics(model_param)
 
     dof = model_param['LASDRA']['dof']
-    q_des = np.zeros((T, dof, 1))
+
+    # 링크 길이(수평 제약에 사용)
+    try:
+        link_len = float(model_param['ODAR'][0].length)
+    except Exception:
+        link_len = float(model_param['ODAR'][0]['length'])
+
+    # 2) 임의 SE(3) 경로 생성
+    q0 = (2 * np.random.rand(dof, 1) - 1) * np.pi
+    T_des_series = generate_random_se3_series(
+        fk_solver, q0, link_count, link_len, T=T, max_pos_step=0.001, max_rot_step=0.001
+    )
+
+    # 3) IK로 q_des, dq_des, ddq_des 생성
+    q_des  = np.zeros((T, dof, 1))
     dq_des = np.zeros((T, dof, 1))
     ddq_des = np.zeros((T, dof, 1))
 
-    # 초기 상태
-    q_des[0, :, 0] = (2 * np.random.rand(dof) - 1) * np.pi
-    dq_des[0, :, 0] = 0
-    ddq_des[0, :, 0] = 0
+    try:
+        q_des[0] = solve_ik(ik_solver, T_des_series[0], q0)
+    except Exception:
+        q_des[0] = q0  # IK 실패 시 초기값 유지
 
-    dt = 0.1
-    # 간단한 랜덤 워크로 q_des 생성
     for t in range(1, T):
-        delta_q = (2 * np.random.rand(dof) - 1) * 0.1
-        q_new = q_des[t-1, :, 0] + delta_q
-        q_new = np.mod(q_new + np.pi, 2*np.pi) - np.pi
+        q_init = q_des[t-1]
+        try:
+            q_sol = solve_ik(ik_solver, T_des_series[t], q_init)
+        except Exception:
+            q_sol = q_init  # 실패 시 이전 값 유지
+        q_des[t] = q_sol
+        dq_des[t] = (q_des[t] - q_des[t-1]) / dt
+        ddq_des[t] = (dq_des[t] - dq_des[t-1]) / dt
 
-        T_new = fk_solver.compute_end_effector_frame(q_new)
-        x, y, z = T_new[0, 3], T_new[1, 3], T_new[2, 3]
-        attempts = 0
-        while (z < -1 or z > 3 or np.hypot(x, y) > link_count * 1.0) and attempts < 5:
-            delta_q = -0.5 * delta_q
-            q_new = q_des[t-1, :, 0] + delta_q
-            q_new = np.mod(q_new + np.pi, 2*np.pi) - np.pi
-            T_new = fk_solver.compute_end_effector_frame(q_new)
-            x, y, z = T_new[0, 3], T_new[1, 3], T_new[2, 3]
-            attempts += 1
-        if z < -1 or z > 3 or np.hypot(x, y) > link_count * 1.0:
-            q_new = q_des[t-1, :, 0]
+    # (선택) 수치 안정화가 필요하면 ddq clip:
+    # ddq_des = np.clip(ddq_des, -10.0, 10.0)
 
-        q_des[t, :, 0] = q_new
-        dq_des[t, :, 0] = (q_des[t, :, 0] - q_des[t-1, :, 0]) / dt
-        ddq_des[t, :, 0] = (dq_des[t, :, 0] - dq_des[t-1, :, 0]) / dt if t > 1 else 0
-
-    # 목표 T 시퀀스
-    T_des_series = [fk_solver.compute_end_effector_frame(q_des[t, :, 0]) for t in range(T)]
-
-    # 추력 분배 해 (정상 상태) 계산
+    # 4) λ_des 계산
     lambda_des = np.zeros((T, 8 * link_count))
     for t in range(T):
         robot.set_joint_states(q_des[t], dq_des[t])
         tau = robot.Mass @ ddq_des[t] + robot.Cori @ dq_des[t] + robot.Grav  # (dof,1)
-        tau = tau.flatten()
-        H = robot.D.T @ robot.B_blkdiag  # (dof, sum_rotors)
-        lambda_sol = np.linalg.pinv(H) @ tau
-        lambda_des[t, :] = lambda_sol
+        H = robot.D.T @ robot.B_blkdiag                                     # (dof, 8N)
+        lambda_des[t, :] = (np.linalg.pinv(H) @ tau).reshape(-1)
 
-    # 고장 주입 (2D 입력 지원)
-    lambda_faulty, type_matrix = inject_faults(lambda_des, fault_time=fault_time, epsilon_scale=epsilon_scale)
+    # 5) fault 주입
+    lambda_faulty, type_matrix = inject_faults(
+        lambda_des, fault_time=fault_time, epsilon_scale=epsilon_scale
+    )  # lambda_faulty: (T, 8N), type_matrix: (N, 8) (1:정상,0:고장)
 
-    # 실제 궤적 적분
+    # 6) λ_fault로 실제 궤적 적분 → actual SE(3)
     actual_q = np.zeros_like(q_des)
     actual_dq = np.zeros_like(dq_des)
     actual_q[0] = q_des[0]
-    actual_dq[0] = dq_des[0]
+    actual_dq[0] = np.zeros_like(q_des[0])
+
     robot.set_joint_states(actual_q[0], actual_dq[0])
     T_actual_series = [fk_solver.compute_end_effector_frame(actual_q[0, :, 0])]
+
     for t in range(1, T):
+        # 링크별 외력 합성
         F_total = np.zeros((6 * link_count, 1))
-        for link_idx in range(link_count):
-            thrust_i = lambda_faulty[t, link_idx*8:(link_idx+1)*8]
-            Fi = robot.B_cell[link_idx] @ thrust_i.reshape(-1, 1)
-            F_total[6*link_idx:6*(link_idx+1)] = Fi
-        tau_fault = robot.D.T @ F_total  # (dof,1)
+        for i in range(link_count):
+            thrust_i = lambda_faulty[t, i*8:(i+1)*8]        # (8,)
+            Fi = robot.B_cell[i] @ thrust_i.reshape(-1, 1)  # (6,1)
+            F_total[6*i:6*(i+1)] = Fi
+
+        tau_fault = robot.D.T @ F_total                     # (dof,1)
         next_state = robot.get_next_joint_states(dt, tau_fault)
         actual_q[t] = next_state['q']
         actual_dq[t] = next_state['dq']
         robot.set_joint_states(actual_q[t], actual_dq[t])
         T_actual_series.append(fk_solver.compute_end_effector_frame(actual_q[t, :, 0]))
 
-    return T_des_series, T_actual_series, type_matrix
+    # 7) 라벨 (200, 8N): t<fault_time → 1, t>=fault_time → type_matrix(펼침)
+    label = np.ones((T, 8 * link_count), dtype=int)
+    label_fault = type_matrix.reshape(-1)  # (8N,), 1정상 0고장
+    if fault_time < T:
+        label[fault_time:, :] = np.tile(label_fault, (T - fault_time, 1))
+
+    desired_np = np.stack(T_des_series, axis=0)   # (T, 4, 4)
+    actual_np  = np.stack(T_actual_series, axis=0)
+
+    return desired_np, actual_np, label
 
 
+# ----------------------------
+# 메인: 여러 샘플 생성 및 저장
+# ----------------------------
 if __name__ == '__main__':
-    link_count = int(input("How many links?: "))
+    link_count = int(input("How many links?: ").strip())
 
     os.makedirs("data_storage", exist_ok=True)
 
-    NUM_SAMPLES = 1000
-    all_desired = []
-    all_actual = []
-    all_labels = []
+    T = 200
+    FAULT_TIME = 100          # 0-based index: t>=100 → (1-based 101~200)
+    NUM_SAMPLES = 50
+    dt = 0.01                 # ✅ 고정 시간 간격(초)
+    timestamps = np.arange(T) * dt  # ✅ [0.00, 0.01, ..., 1.99] (shape: (200,))
+
+    all_desired, all_actual, all_labels = [], [], []
 
     try:
         for i in range(NUM_SAMPLES):
-            # 진행률 표시
             _progress_bar(i, NUM_SAMPLES, prefix="Generating samples")
+            desired, actual, label = generate_one_sample(
+                link_count=link_count, T=T, fault_time=FAULT_TIME, epsilon_scale=0.05, dt=dt
+            )
+            all_desired.append(desired)  # (T,4,4)
+            all_actual.append(actual)    # (T,4,4)
+            all_labels.append(label)     # (T,8N)
 
-            T_des, T_act, label = generate_random_trajectory(link_count=link_count)
-            all_desired.append(np.stack(T_des))
-            all_actual.append(np.stack(T_act))
-            all_labels.append(label)
-
-        # 배열로 변환
         all_desired = np.array(all_desired)
-        all_actual = np.array(all_actual)
-        all_labels = np.array(all_labels)
+        all_actual  = np.array(all_actual)
+        all_labels  = np.array(all_labels)
 
-        print("Saving to fault_dataset.npz...")
-        np.savez("data_storage/fault_dataset.npz", desired=all_desired, actual=all_actual, label=all_labels)
+        print("Saving to data_storage/fault_dataset.npz ...")
+        np.savez("data_storage/fault_dataset.npz",
+                 desired=all_desired, actual=all_actual, label=all_labels, timestamps=timestamps)  # ✅ 추가 저장
         print("Dataset saved successfully.")
 
     except KeyboardInterrupt:
-        # CTRL+C 시, 생성한 만큼이라도 저장
+        # 중단 시 부분 저장
         print("\nInterrupted. Saving partial results...")
         if len(all_desired) > 0:
             all_desired = np.array(all_desired)
-            all_actual = np.array(all_actual)
-            all_labels = np.array(all_labels)
-            np.savez("data_storage/fault_dataset_partial.npz", desired=all_desired, actual=all_actual, label=all_labels)
+            all_actual  = np.array(all_actual)
+            all_labels  = np.array(all_labels)
+            np.savez("data_storage/fault_dataset_partial.npz",
+                     desired=all_desired, actual=all_actual, label=all_labels, timestamps=timestamps)
             print("Partial dataset saved to data_storage/fault_dataset_partial.npz")
         else:
             print("No samples were generated. Nothing to save.")
