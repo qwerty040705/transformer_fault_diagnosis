@@ -7,9 +7,17 @@ from fault_diagnosis_model import FaultDiagnosisTransformer
 
 # -------- Config --------
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-link_count = 1
+
+# 링크 수 입력
+try:
+    link_count = int(input("How many links?: ").strip())
+except Exception:
+    link_count = 1
+    print("[WARN] Invalid input. Fallback to link_count=1")
+
 data_path = os.path.join(repo_root, f"data_storage/link_{link_count}/fault_dataset.npz")
-ckpt_path = os.path.join(repo_root, "fault_diagnosis_transformer.pth")
+ckpt_path = os.path.join(repo_root, "Transformer", f"Transformer_link_{link_count}.pth")
+
 batch_size = 64
 seed = 42
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -29,7 +37,8 @@ X = np.concatenate([des_12, act_12], axis=2).astype(np.float32)  # (S,T,24)
 y = labels[:, -1, :].astype(np.float32)                          # (S,M)
 
 # -------- Load checkpoint --------
-ckpt = torch.load(ckpt_path, map_location="cpu")  # 신뢰 가능한 파일만 로드하세요
+# 신뢰 가능한 파일만 로드하세요. (PyTorch의 향후 기본값 변경 경고가 뜰 수 있음)
+ckpt = torch.load(ckpt_path, map_location="cpu")
 train_mean = ckpt["train_mean"]; train_std = ckpt["train_std"]
 input_dim  = ckpt["input_dim"];  T_ckpt = ckpt["T"]; M_ckpt = ckpt["M"]
 cfg        = ckpt["cfg"]
@@ -57,7 +66,9 @@ model = FaultDiagnosisTransformer(
     output_dim=M,
     max_seq_len=T
 )
-model.load_state_dict(ckpt["model_state"]); model.to(device); model.eval()
+model.load_state_dict(ckpt["model_state"])
+model.to(device)
+model.eval()
 
 # -------- Evaluate --------
 all_probs, all_true = [], []

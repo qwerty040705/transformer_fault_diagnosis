@@ -6,20 +6,26 @@ from torch.utils.data import TensorDataset, DataLoader, random_split
 from fault_diagnosis_model import FaultDiagnosisTransformer
 
 # -------- Config --------
-# 프로젝트 루트 기준 경로 고정 (실행 위치 무관)
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-link_count = 1
+
+# 링크 수 입력
+try:
+    link_count = int(input("How many links?: ").strip())
+except Exception:
+    link_count = 1
+    print("[WARN] Invalid input. Fallback to link_count=1")
+
 data_path = os.path.join(repo_root, f"data_storage/link_{link_count}/fault_dataset.npz")
 
 batch_size = 16
-epochs = 200            # Early Stopping이 알아서 끊어줄 거라 넉넉히
+epochs = 200            # Early Stopping이 알아서 끊음
 lr = 1e-3
 weight_decay = 1e-4
 seed = 42
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Early Stopping
-patience = 10           # 개선 없으면 10 epoch 후 중단
+patience = 10
 patience_counter = 0
 
 torch.manual_seed(seed)
@@ -33,7 +39,7 @@ labels  = data["label"]      # (S, T, M)  where M = 8 * link_count
 
 S, T, _, _ = desired.shape
 M = labels.shape[2]
-print(f"Loaded: S={S}, T={T}, M={M} (motors)")
+print(f"Loaded: S={S}, T={T}, M={M} (motors) from link_{link_count}")
 
 # -------- Build 24-dim inputs: top 3x4 (12) for desired/actual --------
 des_12 = desired[:, :, :3, :4].reshape(S, T, 12)  # (S,T,12)
@@ -81,7 +87,11 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_dec
 
 # -------- Train loop with Early Stopping --------
 best_val = float("inf")
-save_path = os.path.join(repo_root, "fault_diagnosis_transformer.pth")
+
+# 저장 경로: Transformer 폴더 안, 이름은 Transformer_link_#.pth
+ckpt_dir = os.path.join(repo_root, "Transformer")
+os.makedirs(ckpt_dir, exist_ok=True)
+save_path = os.path.join(ckpt_dir, f"Transformer_link_{link_count}.pth")
 
 for ep in range(1, epochs + 1):
     # Train
