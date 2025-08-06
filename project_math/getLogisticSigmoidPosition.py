@@ -1,33 +1,20 @@
 import numpy as np
 
 def getLogisticSigmoidPosition(s_end, t_end, t_query, t_d=0.5):
-    """
-    Compute the position for a given time interval and length with zero
-    starting and terminating speed using a sigmoid (tanh) function.
-
-    Parameters:
-        s_end (ndarray): target position (n x 1) or (n,)
-        t_end (float): total duration
-        t_query (ndarray): time query points (T,)
-        t_d (float): duration of acceleration/deceleration phase (default: 0.5)
-
-    Returns:
-        ndarray: position at t_query (n x T)
-    """
-    a = 5  # Slope parameter
+    a = 5 
 
     if 2 * t_d > t_end:
         raise ValueError("improper calculation conducted: t_d * 2 > t_end")
 
     s_end = np.atleast_2d(s_end)
     if s_end.shape[0] < s_end.shape[1]:
-        s_end = s_end.T  # ensure (n, 1)
+        s_end = s_end.T  
     n = s_end.shape[0]
 
     t_query = np.atleast_1d(t_query).flatten()
     T = t_query.shape[0]
 
-    v_0 = s_end / (t_end - t_d)  # (n, 1)
+    v_0 = s_end / (t_end - t_d) 
     x_query = np.zeros((n, T))
 
     idx1 = t_query <= t_d
@@ -37,7 +24,7 @@ def getLogisticSigmoidPosition(s_end, t_end, t_query, t_d=0.5):
     if np.any(idx1):
         tq = t_query[idx1]
         term = 0.25 * t_d / a * np.log(np.cosh(a * (2 * tq / t_d - 1)) / np.cosh(a)) + 0.5 * tq
-        x_query[:, idx1] = v_0 @ term.reshape(1, -1)  # (n x 1) @ (1 x len(tq))
+        x_query[:, idx1] = v_0 @ term.reshape(1, -1) 
 
     if np.any(idx2):
         tq = t_query[idx2]

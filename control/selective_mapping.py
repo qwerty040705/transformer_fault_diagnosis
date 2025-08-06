@@ -8,7 +8,6 @@ class SelectiveMapping:
         self.eps1 = None  # for future use
 
     def get_adjusted_thrust(self, wrench_d):
-        # wrench_d: dict with 'force' and 'torque' as 3D numpy arrays
         F = self.convert_wrench_to_matrix(wrench_d)
         lambda_ = np.linalg.pinv(self.B) @ F
 
@@ -32,11 +31,9 @@ class SelectiveMapping:
         return lambda_
 
     def avoid_dead_zones(self, lambda_):
-        # TODO: implement algorithm based on self.eps0
         return lambda_
 
     def smooth_set_points(self, lambda_):
-        # TODO: implement algorithm based on self.eps1
         return lambda_
 
     @staticmethod
