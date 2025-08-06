@@ -283,7 +283,7 @@ if __name__ == '__main__':
 
     T = 200
     FAULT_TIME = 100
-    NUM_SAMPLES = 2              # ****************  Number of dataset  ********************
+    NUM_SAMPLES = 100              # ****************  Number of dataset  ********************
     dt = 0.01
     timestamps = np.arange(T) * dt
 

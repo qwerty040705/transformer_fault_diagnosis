@@ -1,4 +1,3 @@
-# control/external_actuation.py
 import numpy as np
 from scipy.sparse import block_diag
 from scipy.optimize import linprog, minimize
