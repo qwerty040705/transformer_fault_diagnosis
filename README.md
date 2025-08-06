@@ -17,7 +17,7 @@ For a closer inspection, `check_dataset_SE3.py` allows you to view the label arr
 
 
 <p>&nbsp;</p>
-<p>&nbsp;</p>
+
 ### 💻 How to generate Data
 
 **1) Data Generation**
@@ -99,7 +99,7 @@ Actual SE(3):
 
 
 <p>&nbsp;</p>
-<p>&nbsp;</p>
+
 ### 💻 How to train and test a Transformer-based model
 
 **1) Training** 🛠
