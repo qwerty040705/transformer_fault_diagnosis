@@ -14,6 +14,9 @@ To verify the integrity of the dataset, `check_dataset_NaN_inf.py` can be used t
 🔍 **Detailed Inspection**  
 For a closer inspection, `check_dataset_SE3.py` allows you to view the label array (fault status), the desired and actual SE(3) transformation matrices, as well as their decomposed position vectors and rotation matrices for specific samples and timesteps, and it also lists fault occurrences in `(time, motor)` format.  
 
+🧠 **Transformer Training & Evaluation**  
+After generating the dataset, you can train the Transformer-based fault diagnosis model using `Transformer/train_fault_transformer.py` and evaluate its performance with `Transformer/eval_fault_transformer.py`.  
+During training, the script will automatically save the best model checkpoint based on validation loss, and early stopping will prevent overfitting. The evaluation script outputs key metrics such as AUROC, AUPRC, macro/micro F1-scores, and per-motor F1-scores.
 
 
 <p>&nbsp;</p>
