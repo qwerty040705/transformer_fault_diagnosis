@@ -1,0 +1,18 @@
+# Core numerical & scientific computing
+numpy>=1.23.0
+scipy>=1.10.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# HTTP requests (used in some parts of the code)
+requests>=2.31.0
+urllib3>=1.26.16
+chardet>=4.0.0
+
+# Machine Learning / Transformer training (future use)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Optional: tqdm for progress bars (cleaner than custom one)
+tqdm>=4.65.0
