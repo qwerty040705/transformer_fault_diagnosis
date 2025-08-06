@@ -191,6 +191,7 @@ class LASDRA:
         self.Fodar[6*iodar:6*(iodar+1)] = Fi
 
     def get_next_joint_states(self, dt, tau_odar, external_wrench=None):
+        self.step_count = getattr(self, "step_count", -1) + 1
         """
         tau_odar: (dof, 1)
         기본 적분기: semi-implicit Euler (빠르고 안정적)
@@ -203,6 +204,13 @@ class LASDRA:
             external_wrench_b = blkR.T @ np.vstack((external_wrench['torque'], external_wrench['force']))
             tau_net = tau_odar + self.fk.compute_end_effector_body_jacobian(self.q).T @ external_wrench_b
 
+            if np.any(np.isnan(tau_net - self.Cori @ self.dq - self.Grav)) or np.any(np.isinf(tau_net - self.Cori @ self.dq - self.Grav)):
+                print(f"[❌] RHS (tau - Cori*dq - Grav) has NaN or Inf at step {self.step_count}")
+            if np.any(np.isnan(self.Mass)) or np.any(np.isinf(self.Mass)):
+                print(f"[❌] Mass matrix has NaN or Inf at step {self.step_count}")
+
+
+
         # M(q) ddq + C(q,dq)dq + g(q) = tau_net  →  ddq = M^{-1}(tau_net - C dq - g)
         ddq = np.linalg.solve(self.Mass, tau_net - self.Cori @ self.dq - self.Grav)
 
@@ -210,6 +218,8 @@ class LASDRA:
         dq_next = self.dq + dt * ddq
         q_next = self.q + dt * dq_next
         return {'q': q_next, 'dq': dq_next}
+
+
 
     # 만약 예전의 수치적 중점 적분을 쓰고 싶다면(매우 느림):
     # return self.passive_midpoint_integration(tau_net, ddq, dt)

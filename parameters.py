@@ -1,5 +1,5 @@
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # ---------- Utility Functions ----------
 def skew(v):

@@ -43,5 +43,4 @@ plt.title("Actual Trajectory (Position)")
 plt.xlabel("Time step"); plt.ylabel("Position [m]")
 plt.legend(); plt.grid(True)
 
-plt.tight_layout()
-plt.show()
+

@@ -66,22 +66,13 @@ def solve_ik(ik_solver, T_target, q_init):
     return q
 
 
-# ----------------------------
-# 임의 SE(3) 경로 생성 (T개)
-# ----------------------------
 def generate_random_se3_series(fk_solver, q0, link_count, link_length, T=200,
                                max_pos_step=0.001, max_rot_step=0.001):
     """
-    무작위지만 제약을 만족하는 부드러운 SE(3) 시계열 생성.
-    - 시작은 q0에서의 FK pose
-    - 매 스텝: 작은 임의 위치/자세 증분 (라디안/미터)
-    제약:
-      z ∈ [-1, 3]
-      sqrt(x^2 + y^2) < link_length * link_count
-    Orientation: 전 범위, 단 스텝은 작은 랜덤 회전 누적으로 부드럽게
-    Args:
-        max_pos_step: 스텝당 최대 위치 변화 (m)
-        max_rot_step: 스텝당 최대 회전 변화 (rad)
+    링크 수에 따라 제약을 둔 무작위 SE(3) 시계열 생성기.
+    - n = 1: 구면상 위치 + 고정 orientation
+    - n = 2: 구 안 위치 + 제한된 z축 회전
+    - n >=3: 구 안 위치 + 전방위 소규모 회전
     """
     T0 = fk_solver.compute_end_effector_frame(q0.reshape(-1))
     R_cur = R.from_matrix(T0[:3, :3])
@@ -96,37 +87,54 @@ def generate_random_se3_series(fk_solver, q0, link_count, link_length, T=200,
             dp = np.random.uniform(-max_pos_step, max_pos_step, size=3)
             p_cand = p_cur + dp
 
-            # 2) 제약 보정
-            if not (-0.5 <= p_cand[2] <= 1.0):
-                dp[2] *= 0.3
-                p_cand = p_cur + dp
-            if np.hypot(p_cand[0], p_cand[1]) > r_max:
-                dp[:2] *= 0.3
-                p_cand = p_cur + dp
+            # 2) 위치 보정 (링크 수별 제약)
+            if link_count == 1:
+                # 반지름 고정: 구면 위 유지
+                norm = np.linalg.norm(p_cand)
+                if norm > 1e-6:
+                    p_cand = p_cand / norm * link_length
+                else:
+                    p_cand = np.array([link_length, 0, 0])
+                R_new = R.identity()  # orientation 고정
+            elif link_count == 2:
+                # 거리만 제약 (반지름 2 이내)
+                if np.linalg.norm(p_cand) > r_max:
+                    dp *= 0.3
+                    p_cand = p_cur + dp
 
-            # 3) 회전 증분 (라디안)
-            axis = np.random.randn(3)
-            n = np.linalg.norm(axis)
-            if n < 1e-12:
-                axis = np.array([1.0, 0.0, 0.0])
+                # 제한된 z축 회전
+                axis = np.array([0.0, 0.0, 1.0])
+                angle = np.random.uniform(-max_rot_step * 0.5, max_rot_step * 0.5)
+                R_step = R.from_rotvec(axis * angle)
+                R_new = R_cur * R_step
             else:
-                axis = axis / n
-            angle = np.random.uniform(-max_rot_step, max_rot_step)
-            R_step = R.from_rotvec(axis * angle)
+                # 일반 회전 및 위치 제약
+                if np.linalg.norm(p_cand) > r_max:
+                    dp *= 0.3
+                    p_cand = p_cur + dp
 
-            R_new = R_cur * R_step
+                axis = np.random.randn(3)
+                norm = np.linalg.norm(axis)
+                if norm < 1e-12:
+                    axis = np.array([1.0, 0.0, 0.0])
+                else:
+                    axis = axis / norm
+                angle = np.random.uniform(-max_rot_step, max_rot_step)
+                R_step = R.from_rotvec(axis * angle)
+                R_new = R_cur * R_step
+
+            # 3) SE(3) 생성
             T_new = np.eye(4)
             T_new[:3, :3] = R_new.as_matrix()
             T_new[:3, 3] = p_cand
 
-            # 유효 값이면 채택
+            # 4) 유효성 검사
             if not np.any(np.isnan(T_new)) and not np.any(np.isinf(T_new)):
                 T_series.append(T_new)
                 R_cur = R_new
                 p_cur = p_cand
                 break
         else:
-            # 10회 실패 → 이전 포즈 유지
             T_series.append(T_series[-1].copy())
 
     return T_series
@@ -191,8 +199,7 @@ def generate_one_sample(link_count, T=200, fault_time=100, epsilon_scale=0.05, d
         dq_des[t] = (q_des[t] - q_des[t-1]) / dt
         ddq_des[t] = (dq_des[t] - dq_des[t-1]) / dt
 
-    # (선택) 수치 안정화가 필요하면 ddq clip:
-    # ddq_des = np.clip(ddq_des, -10.0, 10.0)
+    ddq_des = np.clip(ddq_des, -20.0, 20.0)
 
     # 4) λ_des 계산
     lambda_des = np.zeros((T, 8 * link_count))
@@ -200,7 +207,7 @@ def generate_one_sample(link_count, T=200, fault_time=100, epsilon_scale=0.05, d
         robot.set_joint_states(q_des[t], dq_des[t])
         tau = robot.Mass @ ddq_des[t] + robot.Cori @ dq_des[t] + robot.Grav  # (dof,1)
         H = robot.D.T @ robot.B_blkdiag                                     # (dof, 8N)
-        lambda_des[t, :] = (np.linalg.pinv(H) @ tau).reshape(-1)
+        lambda_des[t, :] = (np.linalg.pinv(H, rcond=1e-4) @ tau).reshape(-1)
 
     # 5) fault 주입
     lambda_faulty, type_matrix = inject_faults(
