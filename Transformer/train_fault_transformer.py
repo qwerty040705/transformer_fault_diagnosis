@@ -8,7 +8,6 @@ from fault_diagnosis_model import FaultDiagnosisTransformer
 # -------- Config --------
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 링크 수 입력
 try:
     link_count = int(input("How many links?: ").strip())
 except Exception:
@@ -18,7 +17,7 @@ except Exception:
 data_path = os.path.join(repo_root, f"data_storage/link_{link_count}/fault_dataset.npz")
 
 batch_size = 16
-epochs = 200            # Early Stopping이 알아서 끊음
+epochs = 200           
 lr = 1e-3
 weight_decay = 1e-4
 seed = 42
@@ -88,7 +87,6 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_dec
 # -------- Train loop with Early Stopping --------
 best_val = float("inf")
 
-# 저장 경로: Transformer 폴더 안, 이름은 Transformer_link_#.pth
 ckpt_dir = os.path.join(repo_root, "Transformer")
 os.makedirs(ckpt_dir, exist_ok=True)
 save_path = os.path.join(ckpt_dir, f"Transformer_link_{link_count}.pth")
@@ -108,7 +106,6 @@ for ep in range(1, epochs + 1):
         tr_loss_sum += loss.item() * xb.size(0)
     tr_loss = tr_loss_sum / max(1, len(train_ds))
 
-    # Validate
     model.eval()
     val_loss_sum = 0.0
     with torch.no_grad():
@@ -121,8 +118,7 @@ for ep in range(1, epochs + 1):
 
     print(f"[{ep:03d}] train_loss={tr_loss:.4f} | val_loss={val_loss:.4f}")
 
-    # Save best & Early Stopping
-    if val_loss < best_val - 1e-6:  # 미세한 변동 무시
+    if val_loss < best_val - 1e-6:  
         best_val = val_loss
         torch.save({
             "model_state": model.state_dict(),

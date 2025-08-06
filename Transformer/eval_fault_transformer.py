@@ -8,7 +8,6 @@ from fault_diagnosis_model import FaultDiagnosisTransformer
 # -------- Config --------
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 링크 수 입력
 try:
     link_count = int(input("How many links?: ").strip())
 except Exception:
@@ -30,21 +29,18 @@ labels  = data["label"]      # (S, T, M)
 S, T, _, _ = desired.shape
 M = labels.shape[2]
 
-# Build 24-dim inputs
 des_12 = desired[:, :, :3, :4].reshape(S, T, 12)
 act_12 = actual[:,  :, :3, :4].reshape(S, T, 12)
 X = np.concatenate([des_12, act_12], axis=2).astype(np.float32)  # (S,T,24)
 y = labels[:, -1, :].astype(np.float32)                          # (S,M)
 
 # -------- Load checkpoint --------
-# 신뢰 가능한 파일만 로드하세요. (PyTorch의 향후 기본값 변경 경고가 뜰 수 있음)
 ckpt = torch.load(ckpt_path, map_location="cpu")
 train_mean = ckpt["train_mean"]; train_std = ckpt["train_std"]
 input_dim  = ckpt["input_dim"];  T_ckpt = ckpt["T"]; M_ckpt = ckpt["M"]
 cfg        = ckpt["cfg"]
 assert input_dim == 24 and T_ckpt == T and M_ckpt == M, "Checkpoint/Data mismatch."
 
-# Normalize with train stats
 X = (X - train_mean) / train_std
 X_t = torch.from_numpy(X); y_t = torch.from_numpy(y)
 
@@ -81,7 +77,6 @@ with torch.no_grad():
 probs = np.concatenate(all_probs, axis=0)
 true  = np.concatenate(all_true,  axis=0)
 
-# Metrics
 try:
     auroc_macro = roc_auc_score(true, probs, average="macro")
     auroc_micro = roc_auc_score(true, probs, average="micro")

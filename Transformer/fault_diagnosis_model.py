@@ -13,7 +13,7 @@ class FaultDiagnosisTransformer(nn.Module):
         dropout=0.1,
         output_dim=8,
         max_seq_len=200,
-        mlp_head=True,            # 분류 헤드를 MLP로 할지 여부
+        mlp_head=True,           
     ):
         super().__init__()
         self.max_seq_len = max_seq_len
@@ -21,12 +21,10 @@ class FaultDiagnosisTransformer(nn.Module):
 
         self.input_proj = nn.Linear(input_dim, d_model)
 
-        # [B, 1, d], [1, T+1, d]
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len + 1, d_model))
         self.pos_drop = nn.Dropout(p=dropout)
 
-        # batch_first=True 로 경고 제거 + 성능 향상
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -34,12 +32,12 @@ class FaultDiagnosisTransformer(nn.Module):
             dropout=dropout,
             activation='relu',
             batch_first=True,
-            norm_first=True,  # pre-norm
+            norm_first=True, 
         )
         self.encoder = nn.TransformerEncoder(
             enc_layer,
             num_layers=num_layers,
-            norm=nn.LayerNorm(d_model),  # 최종 LayerNorm
+            norm=nn.LayerNorm(d_model),  
         )
 
         if mlp_head:

@@ -1,4 +1,3 @@
-# data_generate/data_generate.py
 import sys
 import os
 import io
@@ -6,7 +5,6 @@ import time
 import contextlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# --- repo import path (자식 프로세스에서도 유효) ---
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -14,7 +12,6 @@ import numpy as np
 from dynamics.forward_kinematics_class import ForwardKinematics
 from dynamics.lasdra_class import LASDRA
 from planning.closed_loop_inverse_kinematics import ClosedLoopInverseKinematics
-# 빠른 fault 주입이 있으면 사용, 없으면 기존 함수 사용
 try:
     from fault_injection_fast import inject_faults_fast as inject_faults
 except Exception:
@@ -40,9 +37,6 @@ def _format_hms(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 def _progress_bar(done, total, prefix="Generating samples", start_time=None):
-    """
-    단일 진행바(100칸) + 경과/ETA. 같은 줄에서 갱신.
-    """
     bar_len = 100
     done = max(0, min(done, total))
     frac = (done / total) if total > 0 else 1.0
@@ -99,11 +93,10 @@ def solve_ik(ik_solver, T_target, q_init, dof_target=None):
 
 
 def solve_lambda_damped(H, tau, mu=1e-4):
-    # H: [dof x m], tau: [dof x 1]
     dof = H.shape[0]
     A = H @ H.T + mu * np.eye(dof)
-    y = np.linalg.solve(A, tau)      # [dof x 1]
-    lam = H.T @ y                    # [m x 1]
+    y = np.linalg.solve(A, tau)    
+    lam = H.T @ y                   
     return lam
 
 
@@ -207,13 +200,11 @@ def generate_one_sample(link_count, T=200, fault_time=100, epsilon_scale=0.05, d
     except Exception:
         link_len = float(model_param['ODAR'][0]['length'])
 
-    # 목표 SE3 시퀀스 생성
     q0 = (2 * np.random.rand(dof, 1) - 1) * (0.5 * np.pi)
     T_des_series = generate_random_se3_series(
         fk_solver, q0, num_links, link_len, T=T, max_pos_step=0.001, max_rot_step=0.001
     )
 
-    # IK로 q_des 생성 (semi-implicit)
     q_des  = np.zeros((T, dof, 1))
     dq_des = np.zeros((T, dof, 1))
     ddq_des = np.zeros((T, dof, 1))
@@ -231,14 +222,12 @@ def generate_one_sample(link_count, T=200, fault_time=100, epsilon_scale=0.05, d
     dq_des  = np.clip(dq_des,  -5.0,  5.0)
     ddq_des = np.clip(ddq_des, -20.0, 20.0)
 
-    # 원하는 추력(lambda_des) 계산
     lambda_des = np.zeros((T, 8 * num_links))
     mu_alloc = 1e-4
 
-    # 고정 행렬 미리 준비
-    D_use = robot.D[:6 * num_links, :]                       # [6N x dof]
-    B_use = robot.B_blkdiag[:6 * num_links, :8 * num_links]  # [6N x 8N]
-    H = D_use.T @ B_use                                      # [dof x 8N]
+    D_use = robot.D[:6 * num_links, :]                       
+    B_use = robot.B_blkdiag[:6 * num_links, :8 * num_links] 
+    H = D_use.T @ B_use                                      
 
     for t in range(T):
         robot.set_joint_states(q_des[t], dq_des[t])
@@ -251,12 +240,10 @@ def generate_one_sample(link_count, T=200, fault_time=100, epsilon_scale=0.05, d
         )
         lambda_des[t, :] = lam_t.reshape(-1)
 
-    # 고장 주입
     lambda_faulty, type_matrix = inject_faults(
         lambda_des, fault_time=fault_time, epsilon_scale=epsilon_scale
     )
 
-    # 실제 궤적 적분
     actual_q = np.zeros_like(q_des)
     actual_dq = np.zeros_like(dq_des)
     actual_q[0] = q_des[0]
@@ -266,9 +253,9 @@ def generate_one_sample(link_count, T=200, fault_time=100, epsilon_scale=0.05, d
     T_actual_series = [fk_solver.compute_end_effector_frame(actual_q[0, :, 0])]
 
     for t in range(1, T):
-        thrust_vec = lambda_faulty[t, :].reshape(-1, 1)      # [8N x 1]
-        F_total = B_use @ thrust_vec                         # [6N x 1]
-        tau_fault = D_use.T @ F_total                        # [dof x 1]
+        thrust_vec = lambda_faulty[t, :].reshape(-1, 1)      
+        F_total = B_use @ thrust_vec                        
+        tau_fault = D_use.T @ F_total                       
 
         q_curr = actual_q[t-1]; dq_curr = actual_dq[t-1]
         robot.set_joint_states(q_curr, dq_curr)
@@ -297,7 +284,6 @@ def generate_one_sample(link_count, T=200, fault_time=100, epsilon_scale=0.05, d
         robot.set_joint_states(actual_q[t], actual_dq[t])
         T_actual_series.append(fk_solver.compute_end_effector_frame(actual_q[t, :, 0]))
 
-    # 라벨 생성
     label = np.ones((T, 8 * num_links), dtype=int)
     label_fault = type_matrix.reshape(-1)
     if fault_time < T:
@@ -317,7 +303,7 @@ def _worker(args):
             epsilon_scale=epsilon_scale, dt=dt, seed=seed
         )
     except Exception as e:
-        return e  # 예외를 상위로 넘겨 디버깅 쉽게
+        return e  
 
 
 def generate_dataset_parallel(link_count, T, FAULT_TIME, NUM_SAMPLES, dt, epsilon_scale, workers=None):
@@ -328,10 +314,8 @@ def generate_dataset_parallel(link_count, T, FAULT_TIME, NUM_SAMPLES, dt, epsilo
                  for i in range(NUM_SAMPLES)]
     desired_list, actual_list, label_list = [], [], []
 
-    # 안내 메시지 (개행 포함, 진행바와 겹치지 않도록)
     print(f"Spawning {workers} worker(s)...", flush=True)
 
-    # 시작 직후 0% 진행바 한 번 표시
     done_cnt = 0
     start_time = time.time()
     _progress_bar(done_cnt, NUM_SAMPLES, prefix="Generating samples", start_time=start_time)
@@ -361,7 +345,7 @@ if __name__ == '__main__':
     try:
         NUM_SAMPLES = int(input("How many samples?: ").strip())
     except Exception:
-        NUM_SAMPLES = 100  # fallback
+        NUM_SAMPLES = 100
 
     # workers 입력: 0=자동(코어 수), 1=순차(디버깅), N=병렬 N개
     try:
@@ -374,7 +358,6 @@ if __name__ == '__main__':
     save_dir = os.path.join("data_storage", f"link_{link_count}")
     os.makedirs(save_dir, exist_ok=True)
 
-    # 기본 파라미터
     T = 200
     FAULT_TIME = 100
     dt = 0.01
