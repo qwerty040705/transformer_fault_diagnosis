@@ -34,7 +34,7 @@ How many links do you want to check?: 1
 ✅ label: No NaN/inf found.
 ```
 
-**2) Detailed Inspection**
+**3) Detailed Inspection**
 ```bash
 $ python3 check_dataset_SE3.py
 How many links do you want to check?: 1
