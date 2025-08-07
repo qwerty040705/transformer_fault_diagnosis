@@ -37,7 +37,7 @@ def inject_faults_fast(lambda_arr: np.ndarray,
         N = M // 8
 
         if fault_time is None:
-            t0 = T // 2
+            t0 = rng.integers(low=int(T * 0.2), high=int(T * 0.8))
         elif isinstance(fault_time, float):
             t0 = int(T * fault_time) if 0.0 < fault_time < 1.0 else int(fault_time)
         else:

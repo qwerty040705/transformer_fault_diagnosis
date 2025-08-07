@@ -5,15 +5,15 @@ import torch.nn as nn
 class FaultDiagnosisTransformer(nn.Module):
     def __init__(
         self,
-        input_dim=24,
-        d_model=64,
-        nhead=8,
-        num_layers=2,
-        dim_feedforward=128,
-        dropout=0.1,
-        output_dim=8,
-        max_seq_len=200,
-        mlp_head=True,           
+        input_dim: int = 24,
+        d_model: int = 64,
+        nhead: int = 8,
+        num_layers: int = 2,
+        dim_feedforward: int = 128,
+        dropout: float = 0.1,
+        output_dim: int = 8,
+        max_seq_len: int = 200,
+        mlp_head: bool = True,
     ):
         super().__init__()
         self.max_seq_len = max_seq_len
@@ -23,21 +23,19 @@ class FaultDiagnosisTransformer(nn.Module):
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len + 1, d_model))
-        self.pos_drop = nn.Dropout(p=dropout)
+        self.pos_drop = nn.Dropout(dropout)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            activation='relu',
+            activation="relu",
             batch_first=True,
-            norm_first=True, 
+            norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(
-            enc_layer,
-            num_layers=num_layers,
-            norm=nn.LayerNorm(d_model),  
+            enc_layer, num_layers=num_layers, norm=nn.LayerNorm(d_model)
         )
 
         if mlp_head:
@@ -50,30 +48,31 @@ class FaultDiagnosisTransformer(nn.Module):
         else:
             self.head = nn.Linear(d_model, output_dim)
 
-        # init
-        nn.init.xavier_uniform_(self.input_proj.weight); nn.init.zeros_(self.input_proj.bias)
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
         nn.init.normal_(self.cls_token, std=0.02)
         nn.init.normal_(self.pos_embedding, std=0.02)
-
         for m in self.head.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight); nn.init.zeros_(m.bias)
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    def forward(self, x):  # x: [B, T, input_dim]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
         if T > self.max_seq_len:
-            raise ValueError(f"T={T} exceeds max_seq_len={self.max_seq_len}. "
-                             f"Increase max_seq_len when constructing the model.")
+            raise ValueError(
+                f"T={T} exceeds max_seq_len={self.max_seq_len}. "
+                f"Increase max_seq_len when constructing the model."
+            )
 
-        z = self.input_proj(x)                   # [B, T, d]
-        z = z / math.sqrt(self.d_model)          # embedding scaling
+        z = self.input_proj(x) / math.sqrt(self.d_model)  # [B, T, d]
 
-        cls = self.cls_token.expand(B, 1, -1)    # [B, 1, d]
-        z = torch.cat([cls, z], dim=1)           # [B, T+1, d]
-        z = z + self.pos_embedding[:, :T+1, :]   # [B, T+1, d]
+        cls = self.cls_token.expand(B, 1, -1)            # [B, 1, d]
+        z = torch.cat([cls, z], dim=1)                   # [B, T+1, d]
+        z = z + self.pos_embedding[:, : T + 1]           # add positional enc.
         z = self.pos_drop(z)
 
-        z = self.encoder(z)                      # [B, T+1, d]
-        cls_out = z[:, 0, :]                     # [B, d]
-        logits = self.head(cls_out)              # [B, output_dim]
-        return logits
+        z = self.encoder(z)                              # [B, T+1, d]
+        cls_out = z[:, 0, :]                             # [B, d]
+        return self.head(cls_out)                        # [B, output_dim]
