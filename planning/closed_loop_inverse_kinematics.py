@@ -5,7 +5,7 @@ class ClosedLoopInverseKinematics:
     def __init__(self, param):
         self.dof = param['LASDRA']['dof']
         self.lambda_damping = 0.01 * np.eye(self.dof)
-        self.max_iteration = 100
+        self.max_iteration = 200
         self.convergence_criteria = 1e-8
         self.dt = 0.99
         self.forward_kinematics_class = ForwardKinematics(param)
