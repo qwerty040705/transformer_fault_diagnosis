@@ -82,32 +82,51 @@ save_path = os.path.join(ckpt_dir, f"Transformer_link_{link_count}.pth")
 
 for ep in range(1, epochs + 1):
     # Train
-    model.train(); tr_sum = 0
+    model.train()
+    train_loss_sum = 0.0
     for xb, yb in train_loader:
         xb, yb = xb.to(device), yb.to(device)
         opt.zero_grad()
-        logits = model(xb)                 # (B,T,M)
+        logits = model(xb)                  # (B,T,M)
         loss   = loss_fn(logits, yb)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        tr_sum += loss.item() * xb.size(0)
-    tr_loss = tr_sum / len(train_ds)
-
-    # Validate
-    model.eval(); vl_sum = 0; total_acc = 0
+        train_loss_sum += loss.item() * xb.size(0)
+    tr_loss = train_loss_sum / len(train_ds)
+    
+    # Validation phase
+    model.eval()
+    val_loss_sum = 0.0
+    tp = fp = fn = 0  
     with torch.no_grad():
         for xb, yb in val_loader:
             xb, yb = xb.to(device), yb.to(device)
-            lg = model(xb)  # (B,T,M)
-            vl_sum += loss_fn(lg, yb).item() * xb.size(0)
-            pred = (torch.sigmoid(lg) >= 0.5).int()
-            correct = (pred == yb.int()).float().mean().item()
-            total_acc += correct * xb.size(0)
-    val_loss = vl_sum / len(val_ds)
-    acc      = total_acc / len(val_ds)
+            logits = model(xb)  # (B,T,M)
+            val_loss_sum += loss_fn(logits, yb).item() * xb.size(0)
+            pred = (torch.sigmoid(logits) >= 0.5).int()  # (B,T,M) 0 or 1
+            yb_int = yb.int()
+            for j in range(xb.size(0)):
+                y_np = yb_int[j].cpu().numpy()
+                p_np = pred[j].cpu().numpy()
+                for m in range(M):
+                    if 0 in y_np[:, m]:
+                        if 0 in p_np[:, m]:
+                            tp += 1
+                        else:
+                            fn += 1
+                    else:
+                        if 0 in p_np[:, m]:
+                            fp += 1
+    val_loss = val_loss_sum / len(val_ds)
+    # Precision, Recall, F1 계산
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1   = 2 * tp / (2 * tp + fp + fn) if (2*tp + fp + fn) > 0 else 0.0
 
-    print(f"[{ep:03d}] train={tr_loss:.4f} | val={val_loss:.4f} | acc={acc:.4f}")
+    print(f"[{ep:03d}] train_loss={tr_loss:.4f} | val_loss={val_loss:.4f} "
+          f"| Det Precision={prec:.4f} Recall={rec:.4f} F1={f1:.4f}")
+
 # ─── Save ───────────────────────────────────────────────
 torch.save({
     "model_state": model.state_dict(),
