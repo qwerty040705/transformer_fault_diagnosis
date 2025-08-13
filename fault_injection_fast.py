@@ -3,7 +3,7 @@ from typing import Tuple, Union, Optional, Union as _Union
 
 def inject_faults_fast(lambda_arr: np.ndarray,
                        fault_time: _Union[int, float, None] = None,
-                       epsilon_scale: float = 0,
+                       epsilon_scale: float = 0.0,
                        fault_lambda: float = 1.0,
                        seed: Optional[int] = None,
                        return_labels: bool = False
@@ -23,10 +23,16 @@ def inject_faults_fast(lambda_arr: np.ndarray,
     정의:
       * type_matrix: (N,8) (N=M//8) 링크×모터 라벨(시간축 없음, 0=고장, 1=정상)
       * label_TxM : (T,M) 시간축 라벨(1=정상, 0=고장), t>=t0 & m∈idx → 0
-      * t0: 고장 시작 프레임 인덱스(int). t0==T면 실질적 고장 없음
+      * t0: 고장 시작 프레임 인덱스(int). k==0이면 t0=T (실질적 고장 없음)
       * idx: 고장 모터의 컬럼 인덱스 배열(shape (k,))
       * which_fault_mask: (M,) 모터별 고장 존재 여부(0/1)
       * onset_idx: (M,) 모터별 고장 시작 프레임(없으면 -1)
+
+    주의(수정사항):
+      - 고장 이전 구간엔 노이즈를 주지 않음.
+      - 건강한 모터에는 전 구간 노이즈 주지 않음.
+      - 고장난 모터는 고장 시점 이후에만 '노이즈만' 남기고 베이스 제거.
+      - Poisson 샘플에서 k=0도 허용(완전 정상 샘플 생성 가능).
     """
     rng = np.random.default_rng(seed)
     arr = np.asarray(lambda_arr)
@@ -39,22 +45,35 @@ def inject_faults_fast(lambda_arr: np.ndarray,
             raise ValueError("width must be multiple of 8")
         N = M // 8
 
-        # 고장 모터 수 k (링크 수 N에 클램프) — 최소 1
-        k = min(N, max(1, int(rng.poisson(fault_lambda))))
-        idx = rng.choice(M, size=k, replace=False)
-        fault_mask = np.zeros(M, dtype=bool); fault_mask[idx] = True
+        # 고장 모터 수 k: 0도 허용
+        k_raw = rng.poisson(fault_lambda)
+        k = int(np.clip(k_raw, 0, N))
+
+        if k > 0:
+            idx = rng.choice(M, size=k, replace=False)
+            idx = np.sort(idx)
+        else:
+            idx = np.array([], dtype=int)
+
+        fault_mask = np.zeros(M, dtype=bool)
+        fault_mask[idx] = True
 
         # (N,8) 타입 라벨
         type_matrix = np.ones((N, 8), dtype=int)
-        link_idx, motor_idx = np.divmod(idx, 8)
-        type_matrix[link_idx, motor_idx] = 0
+        if k > 0:
+            link_idx, motor_idx = np.divmod(idx, 8)
+            type_matrix[link_idx, motor_idx] = 0
 
-        # 값 생성
-        ref = np.abs(arr).astype(float)
-        ref[ref < eps] = 1.0
-        noise = rng.normal(0.0, epsilon_scale, size=M) * ref
-        out = arr + noise
-        out[fault_mask] = noise[fault_mask]  # 고장: 베이스 제거, 노이즈만
+        # 출력: 기본적으로 원신호 유지
+        out = arr.copy()
+
+        if k > 0:
+            # 고장 모터는 이 시점에서 베이스 제거 후 노이즈만
+            ref = np.abs(arr).astype(float)
+            ref[ref < eps] = 1.0
+            noise = rng.normal(0.0, epsilon_scale, size=M) * ref
+            out[fault_mask] = noise[fault_mask]
+        # k==0 → out == arr (완전 정상)
 
         return out, type_matrix
 
@@ -68,7 +87,7 @@ def inject_faults_fast(lambda_arr: np.ndarray,
         # 고장 시작 프레임 t0
         if fault_time is None:
             lo = int(T * 0.2)
-            hi = max(int(T * 0.8), lo + 1)  # hi는 제외 상한이므로 최소 한 칸 확보
+            hi = max(int(T * 0.8), lo + 1)  # hi는 제외 상한
             t0 = int(rng.integers(low=lo, high=hi))
         elif isinstance(fault_time, float) and 0.0 < fault_time < 1.0:
             t0 = int(T * fault_time)
@@ -76,37 +95,47 @@ def inject_faults_fast(lambda_arr: np.ndarray,
             t0 = int(fault_time)
         t0 = max(0, min(T, t0))  # 0 ≤ t0 ≤ T
 
-        # 고장 모터 선택
-        k = min(N, max(1, int(rng.poisson(fault_lambda))))
-        idx = rng.choice(M, size=k, replace=False)
-        idx = np.sort(idx)  # 보기 좋게 정렬(선택)
-        fault_mask = np.zeros(M, dtype=bool); fault_mask[idx] = True
+        # 고장 모터 수 k: 0도 허용
+        k_raw = rng.poisson(fault_lambda)
+        k = int(np.clip(k_raw, 0, N))
+        if k > 0:
+            idx = rng.choice(M, size=k, replace=False)
+            idx = np.sort(idx)
+        else:
+            idx = np.array([], dtype=int)
+
+        fault_mask = np.zeros(M, dtype=bool)
+        fault_mask[idx] = True
 
         # (N,8) 타입 라벨(시간축 없음)
         type_matrix = np.ones((N, 8), dtype=int)
-        link_idx, motor_idx = np.divmod(idx, 8)
-        type_matrix[link_idx, motor_idx] = 0
+        if k > 0:
+            link_idx, motor_idx = np.divmod(idx, 8)
+            type_matrix[link_idx, motor_idx] = 0
 
-        # 시간축 라벨 (T,M): 기본 1(정상), t>=t0 & m in idx → 0(고장)
+        # 시간축 라벨 (T,M): 기본 1, t>=t0 & m in idx → 0
         label_TxM = np.ones((T, M), dtype=int)
-        if t0 < T:
+        if k > 0 and t0 < T:
             label_TxM[t0:, fault_mask] = 0
 
-        # 메타: 어느 모터가 고장 / 온셋 프레임
+        # 메타
         which_fault_mask = fault_mask.astype(np.int32)      # (M,) 0/1
         onset_idx = np.full(M, -1, dtype=np.int32)          # (M,)
-        if t0 < T:
+        if k > 0 and t0 < T:
             onset_idx[fault_mask] = t0
+        if k == 0:
+            t0 = T  # 고장 없음 표시
 
-        # 값 생성
-        ref = np.median(np.abs(arr), axis=0).astype(float)
-        ref[ref < eps] = 1.0
-        noise = rng.normal(0.0, epsilon_scale, size=(T, M)) * ref[None, :]
+        # 출력: 기본적으로 원신호 유지
+        out = arr.copy()
 
-        out = arr + noise
-        if t0 < T:
-            # t0 이후 고장 모터는 원신호 대신 노이즈만(베이스 제거)
+        if k > 0 and t0 < T:
+            # t0 이후 고장 모터는 베이스 제거 후 노이즈만
+            ref = np.median(np.abs(arr), axis=0).astype(float)
+            ref[ref < eps] = 1.0
+            noise = rng.normal(0.0, epsilon_scale, size=(T, M)) * ref[None, :]
             out[t0:, fault_mask] = noise[t0:, fault_mask]
+        # (고장 전/건강 모터는 out == arr 유지)
 
         if return_labels:
             return out, type_matrix, label_TxM, int(t0), idx, which_fault_mask, onset_idx
