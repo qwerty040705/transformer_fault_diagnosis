@@ -77,8 +77,8 @@ def solve_ik(ik_solver, T_target, q_init, dof_target=None):
 def solve_lambda_damped(H, tau, mu=1e-4):
     dof = H.shape[0]
     A = H @ H.T + mu * np.eye(dof)
-    y = np.linalg.solve(A, tau)    
-    lam = H.T @ y                   
+    y = np.linalg.solve(A, tau)
+    lam = H.T @ y
     return lam
 
 
@@ -89,9 +89,6 @@ def clip_step(vec, max_abs=None):
     if s > max_abs:
         vec = vec * (max_abs / (s + 1e-12))
     return vec
-
-
-
 
 
 def random_unit():
@@ -108,7 +105,7 @@ def align_z_to(vec_z):
     y = np.cross(z, x_tmp)
     y /= np.linalg.norm(y) + 1e-12
     x = np.cross(y, z)
-    Rm = np.stack([x, y, z], axis=1)  
+    Rm = np.stack([x, y, z], axis=1)
     return R.from_matrix(Rm)
 
 def sample_on_cone(axis, alpha_max):
@@ -119,6 +116,7 @@ def sample_on_cone(axis, alpha_max):
         if np.dot(u, axis) >= cos_max:
             return u
         u = random_unit()
+
 
 # ------------------------------------------------------------
 # 메인 Trajectory generator
@@ -135,20 +133,10 @@ def generate_random_se3_series(
 ):
     """
     반환: [T,4,4] 리스트 (desired SE3 궤적)
-    - n=1  : r=ℓ 구면, EE z축 = p̂, roll 자유
-    - n=2  : (0≤r≤2ℓ)
-        * r≤ℓ      : R ∈ SO(3) (완전)
-        * ℓ<r<2ℓ   : z축이 cone(α<=acos(r/2ℓ)) + roll
-        * r=2ℓ     : z축=p̂, roll
-    - n≥3  : (0≤r≤nℓ)
-        * s=nℓ-r ≥2ℓ → R ∈ SO(3)
-        * 0<s<2ℓ    → z축 cone(α<=acos((r²+ℓ²-(n-1)²ℓ²)/(2rℓ)))+roll
-        * s=0        → z축=p̂, roll
     """
     ℓ = float(link_length)
     n = link_count
 
-    # 시작 프레임
     T0 = fk_solver.compute_end_effector_frame(q0.reshape(-1))
     R_cur = R.from_matrix(T0[:3, :3])
     p_cur = T0[:3, 3].copy()
@@ -158,9 +146,8 @@ def generate_random_se3_series(
 
     for _ in range(1, T):
         for _try in range(max_try):
-            # ------------------------------------------------ position ------------------------------------------------
+            # position
             p_cand = p_cur + np.random.uniform(-max_pos_step, max_pos_step, size=3)
-
             r = np.linalg.norm(p_cand)
             if n == 1:
                 p_cand = p_cand / (r + 1e-12) * ℓ
@@ -170,33 +157,18 @@ def generate_random_se3_series(
                     p_cand *= (r_max / (r + 1e-12))
                     r = r_max
 
-            # ------------------------------------------------ orientation ---------------------------------------------
+            # orientation (간략화)
             if n == 1:
                 roll = np.random.uniform(-max_rot_step, max_rot_step)
-                R_new = R_cur * R.from_rotvec(np.array([0, 0, roll]))  # local roll
-                R_align = align_z_to(p_cand / ℓ)
-                R_new = R_align * R.from_rotvec(np.array([0, 0, roll]))
-
-            elif n == 2:
-                if r <= ℓ + 1e-12: 
-                    R_new = random_so3()
-                elif r >= 2*ℓ - 1e-12:  
-                    roll = np.random.uniform(-max_rot_step, max_rot_step)
-                    R_new = align_z_to(p_cand / r) * R.from_rotvec(np.array([0, 0, roll]))
-                else:  
-                    alpha_max = np.arccos(np.clip(r / (2*ℓ), -1.0, 1.0))
-                    z_dir = sample_on_cone(p_cand / r, alpha_max)
-                    roll = np.random.uniform(-max_rot_step, max_rot_step)
-                    R_new = align_z_to(z_dir) * R.from_rotvec(np.array([0, 0, roll]))
-
-            else:  
+                R_new = align_z_to(p_cand / ℓ) * R.from_rotvec(np.array([0, 0, roll]))
+            else:
                 s = n*ℓ - r
-                if s >= 2*ℓ - 1e-12:        
+                if s >= 2*ℓ - 1e-12:
                     R_new = random_so3()
-                elif s <= 1e-12:             
+                elif s <= 1e-12:
                     roll = np.random.uniform(-max_rot_step, max_rot_step)
                     R_new = align_z_to(p_cand / r) * R.from_rotvec(np.array([0, 0, roll]))
-                else:                          
+                else:
                     alpha_max = np.arccos(
                         np.clip((r**2 + ℓ**2 - (n-1)**2 * ℓ**2) / (2*r*ℓ), -1.0, 1.0)
                     )
@@ -204,7 +176,6 @@ def generate_random_se3_series(
                     roll = np.random.uniform(-max_rot_step, max_rot_step)
                     R_new = align_z_to(z_dir) * R.from_rotvec(np.array([0, 0, roll]))
 
-            # ------------------------------------------------ append if finite ----------------------------------------
             T_new = np.eye(4)
             T_new[:3, :3] = R_new.as_matrix()
             T_new[:3, 3] = p_cand
@@ -213,19 +184,18 @@ def generate_random_se3_series(
                 T_series.append(T_new)
                 p_cur, R_cur = p_cand, R_new
                 break
-        else:  
+        else:
             T_series.append(T_series[-1].copy())
 
     return T_series
 
 
-
 # ---------------- One sample generator ----------------
-def generate_one_sample(link_count, T=200,     
-                        epsilon_scale=0.05, dt=0.01, seed=None):
-    if seed is not None: np.random.seed(seed)
+def generate_one_sample(link_count, T=200, epsilon_scale=0.05, dt=0.01, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
 
-    # ----------- model params -----------
+    # model params
     base_param = get_parameters(link_count)
     base_param['ODAR'] = base_param['ODAR'][:link_count]
     screw_axes, inertias = [], []
@@ -245,14 +215,14 @@ def generate_one_sample(link_count, T=200,
     dof       = model_param['LASDRA']['dof']
     link_len  = float(model_param['ODAR'][0].length)
 
-    # ----------- desired SE(3) traj -----
+    # desired SE(3) trajectory
     q0 = (np.random.rand(dof, 1) * 2 - 1) * 0.5 * np.pi
     T_des_series = generate_random_se3_series(
         fk_solver, q0, link_count, link_len, T=T,
         max_pos_step=0.001, max_rot_step=0.001
     )
 
-    # ----------- IK forward propagate ---
+    # IK forward propagate
     q_des  = np.zeros((T, dof, 1))
     dq_des = np.zeros_like(q_des)
     ddq_des= np.zeros_like(q_des)
@@ -260,14 +230,15 @@ def generate_one_sample(link_count, T=200,
     for t in range(1, T):
         q_sol = solve_ik(ik_solver, T_des_series[t], q_des[t-1], dof)
         dq_tmp = clip_step((q_sol - q_des[t-1]) / dt, 1.0)
-        q_des[t] = q_des[t-1] + dt * dq_tmp
-        dq_des[t] = dq_tmp
+        q_des[t]   = q_des[t-1] + dt * dq_tmp
+        dq_des[t]  = dq_tmp
         ddq_des[t] = (dq_des[t] - dq_des[t-1]) / dt
     dq_des  = np.clip(dq_des,  -5.0,  5.0)
     ddq_des = np.clip(ddq_des, -20.0, 20.0)
 
-    # ----------- desired thrust ---------
-    D_use = robot.D[:6*link_count]; B_use = robot.B_blkdiag[:6*link_count,:8*link_count]
+    # desired thrust λ
+    D_use = robot.D[:6*link_count]
+    B_use = robot.B_blkdiag[:6*link_count, :8*link_count]
     H = D_use.T @ B_use
     lam_des = np.zeros((T, 8*link_count))
     for t in range(T):
@@ -275,21 +246,36 @@ def generate_one_sample(link_count, T=200,
         tau = robot.Mass @ ddq_des[t] + robot.Cori @ dq_des[t] + robot.Grav
         lam_des[t] = np.clip(
             solve_lambda_damped(H, tau).ravel(),
-            -1.5*getattr(robot,"max_thrust",100.0),
-             1.5*getattr(robot,"max_thrust",100.0)
+            -1.5*getattr(robot, "max_thrust", 100.0),
+             1.5*getattr(robot, "max_thrust", 100.0)
         )
 
-    # ----------- fault injection --------
-    lam_faulty, type_matrix = inject_faults(
-        lam_des, epsilon_scale=epsilon_scale
-    )
+    # fault injection (호환: 5개 반환/7개 반환 모두 지원)
+    ret = inject_faults(lam_des, epsilon_scale=epsilon_scale, return_labels=True)
+    # 기대 형태:
+    #  - 7개: (lam_faulty, type_matrix, label_TxM, t0, idx, which_mask, onset_idx)
+    #  - 5개: (lam_faulty, type_matrix, label_TxM, t0, idx)
+    if len(ret) == 7:
+        lam_faulty, type_matrix, label_TxM, t0, idx, which_mask, onset_idx = ret
+    elif len(ret) == 5:
+        lam_faulty, type_matrix, label_TxM, t0, idx = ret
+        M = lam_des.shape[1]
+        which_mask = np.zeros(M, dtype=np.int32)
+        which_mask[np.asarray(idx, dtype=int)] = 1
+        onset_idx = np.full(M, -1, dtype=np.int32)
+        if 0 <= int(t0) < T:
+            onset_idx[np.asarray(idx, dtype=int)] = int(t0)
+    else:
+        raise RuntimeError(f"Unexpected return length from inject_faults: {len(ret)}")
 
-    # ----------- forward dynamics --------
-    actual_q  = np.zeros_like(q_des); actual_dq = np.zeros_like(dq_des)
-    actual_q[0]=q_des[0]; robot.set_joint_states(actual_q[0], np.zeros_like(actual_q[0]))
-    fk_actual = [fk_solver.compute_end_effector_frame(actual_q[0,:,0])]
+    # forward dynamics with faulty thrust
+    actual_q  = np.zeros_like(q_des)
+    actual_dq = np.zeros_like(dq_des)
+    actual_q[0] = q_des[0]
+    robot.set_joint_states(actual_q[0], np.zeros_like(actual_q[0]))
+    fk_actual = [fk_solver.compute_end_effector_frame(actual_q[0, :, 0])]
     for t in range(1, T):
-        thrust  = lam_faulty[t].reshape(-1,1)
+        thrust  = lam_faulty[t].reshape(-1, 1)
         tau_flt = D_use.T @ (B_use @ thrust)
         q, dq = actual_q[t-1], actual_dq[t-1]
         robot.set_joint_states(q, dq)
@@ -299,11 +285,14 @@ def generate_one_sample(link_count, T=200,
             qn, dqn = q, dq
         actual_q[t], actual_dq[t] = qn, dqn
         robot.set_joint_states(qn, dqn)
-        fk_actual.append(fk_solver.compute_end_effector_frame(qn[:,0]))
+        fk_actual.append(fk_solver.compute_end_effector_frame(qn[:, 0]))
 
-    desired_np = np.stack(T_des_series); actual_np = np.stack(fk_actual)
-    label = np.tile(type_matrix.reshape(1,-1), (T,1))
-    return desired_np, actual_np, label
+    desired_np = np.stack(T_des_series)
+    actual_np  = np.stack(fk_actual)
+    label      = label_TxM.astype(np.float32)   # (T,M) 1=정상,0=고장
+
+    # 추가 메타 함께 반환
+    return desired_np, actual_np, label, which_mask.astype(np.int32), onset_idx.astype(np.int32), int(t0)
 
 
 def _worker(args):
@@ -321,9 +310,9 @@ def generate_dataset_parallel(link_count, T, NUM_SAMPLES, dt, epsilon_scale, wor
     args_list = [(link_count, T, epsilon_scale, dt, 1000+i) for i in range(NUM_SAMPLES)]
 
     desired_list, actual_list, label_list = [], [], []
+    which_mask_list, onset_idx_list, t0_list = [], [], []
 
     print(f"Spawning {workers} worker(s)...", flush=True)
-
     done_cnt = 0
     start_time = time.time()
     _progress_bar(done_cnt, NUM_SAMPLES, prefix="Generating samples", start_time=start_time)
@@ -335,16 +324,26 @@ def generate_dataset_parallel(link_count, T, NUM_SAMPLES, dt, epsilon_scale, wor
             if isinstance(res, Exception):
                 print("\n[Worker Error]", repr(res), flush=True)
                 raise res
-            d, a, l = res
-            desired_list.append(d); actual_list.append(a); label_list.append(l)
+
+            d, a, l, which_mask, onset_idx, t0 = res
+            desired_list.append(d)
+            actual_list.append(a)
+            label_list.append(l)
+            which_mask_list.append(which_mask)
+            onset_idx_list.append(onset_idx)
+            t0_list.append(t0)
 
             done_cnt += 1
             _progress_bar(done_cnt, NUM_SAMPLES, prefix="Generating samples", start_time=start_time)
 
-    desired = np.asarray(desired_list)
-    actual  = np.asarray(actual_list)
-    label   = np.asarray(label_list)
-    return desired, actual, label
+    desired = np.asarray(desired_list)            # (S,T,4,4)
+    actual  = np.asarray(actual_list)             # (S,T,4,4)
+    label   = np.asarray(label_list)              # (S,T,M)
+    which_fault_mask = np.asarray(which_mask_list)  # (S,M)
+    onset_idx = np.asarray(onset_idx_list)          # (S,M)
+    t0_arr    = np.asarray(t0_list, dtype=np.int32) # (S,)
+
+    return desired, actual, label, which_fault_mask, onset_idx, t0_arr
 
 
 # ---------------- Main ----------------
@@ -352,7 +351,7 @@ if __name__ == '__main__':
     link_count = int(input("How many links?: ").strip())
 
     try:
-        T = int(input("Sequence length T?: ").strip()) 
+        T = int(input("Sequence length T?: ").strip())
     except Exception:
         T = 200
 
@@ -361,8 +360,6 @@ if __name__ == '__main__':
     except Exception:
         NUM_SAMPLES = 100
 
-    
-    # workers 입력: 0=자동(코어 수), 1=순차(디버깅), N=병렬 N개
     try:
         workers = int(input("How many workers? (0 = AUTO, WARNING: uses all CPU cores & more RAM): ").strip())
     except Exception:
@@ -379,27 +376,41 @@ if __name__ == '__main__':
     timestamps = np.arange(T) * dt
 
     try:
-        desired, actual, label = generate_dataset_parallel(
-        link_count, T, NUM_SAMPLES, dt, epsilon_scale, workers
-    )
+        desired, actual, label, which_mask, onset_idx, t0_arr = generate_dataset_parallel(
+            link_count, T, NUM_SAMPLES, dt, epsilon_scale, workers
+        )
 
         save_path = os.path.join(save_dir, "fault_dataset.npz")
-        np.savez(save_path,
-                 desired=desired,
-                 actual=actual,
-                 label=label,
-                 timestamps=timestamps)
+        np.savez(
+            save_path,
+            desired=desired,            # (S,T,4,4)
+            actual=actual,              # (S,T,4,4)
+            label=label,                # (S,T,M) 1=정상,0=고장  ← 학습 라벨
+            which_fault_mask=which_mask,# (S,M)    0/1          ← 메타
+            onset_idx=onset_idx,        # (S,M)   -1 or t0      ← 메타
+            t0=t0_arr,                  # (S,)     대표 온셋    ← 메타
+            timestamps=timestamps,      # (T,)
+            dt=dt,
+            link_count=link_count
+        )
         print(f"Dataset saved successfully to {save_path}")
 
     except KeyboardInterrupt:
         print("\nInterrupted. Saving partial results...")
         if 'desired' in locals() and len(desired) > 0:
             save_path = os.path.join(save_dir, "fault_dataset_partial.npz")
-            np.savez(save_path,
-                     desired=np.asarray(desired),
-                     actual=np.asarray(actual),
-                     label=np.asarray(label),
-                     timestamps=timestamps)
+            np.savez(
+                save_path,
+                desired=np.asarray(desired),
+                actual =np.asarray(actual),
+                label  =np.asarray(label),
+                which_fault_mask=np.asarray(which_mask),
+                onset_idx=np.asarray(onset_idx),
+                t0=np.asarray(t0_arr, dtype=np.int32),
+                timestamps=timestamps,
+                dt=dt,
+                link_count=link_count
+            )
             print(f"Partial dataset saved to {save_path}")
         else:
             print("No samples were generated. Nothing to save.")

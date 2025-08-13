@@ -22,7 +22,7 @@ print(f"label.shape   = {label.shape} (motor_count={motor_count})")
 
 
 sample_idx = 0
-time_idx_list = [0, 100, 199] 
+time_idx_list = [0, 1,10,50,100,150,200,250, 500, 750, 999] 
 
 def decompose_se3(T):
     R = T[:3, :3] 

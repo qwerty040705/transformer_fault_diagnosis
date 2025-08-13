@@ -1,11 +1,10 @@
 # Transformer/eval_fault_transformer.py
 import os
+import math
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, random_split
-from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
-from fault_diagnosis_model import FaultDiagnosisTransformer
-import matplotlib.pyplot as plt
 
 # ── Config ─────────────────────────────────────────────
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,8 +13,23 @@ batch_size = 64
 seed       = 42
 print("device:", device)
 
+# ====== 지연/후처리 하이퍼파라미터 ======
+MAX_LAG_SEC   = 0.05  # shift-tolerant exact-all: ±이만큼 시프트 허용(초)
+PRE_TOL_SEC   = 0.00  # 온셋 탐지 허용 윈도우(초) - 앞쪽(조기경보 허용폭)
+POST_TOL_SEC  = 0.05  # 온셋 탐지 허용 윈도우(초) - 뒤쪽(지연 허용폭)
+MIN_RUN_PRED  = 1     # 예측 스파이크 억제(연속 0 프레임 최소길이). 1=끄기, 2~3 권장 가능
+
+# ====== Top-K 패턴 매칭 설정 ======
+TOP_K         = 2     # Majority Top-2
+HAMMING_TOL   = 0     # 패턴 일치 허용 해밍 거리(0~2 권장)
+COVERAGE_TAU  = 0.8   # 상위 K 패턴이 전체 프레임에서 차지해야 할 최소 커버리지
+
 # ── Paths ──────────────────────────────────────────────
-link_count = int(input("How many links?: ") or 1)
+try:
+    link_count = int(input("How many links?: ").strip())
+except Exception:
+    link_count = 1
+    print("[WARN] Invalid input. Fallback to link_count=1")
 data_path  = os.path.join(repo_root, f"data_storage/link_{link_count}/fault_dataset.npz")
 ckpt_path  = os.path.join(repo_root, "Transformer", f"Transformer_link_{link_count}.pth")
 
@@ -44,25 +58,244 @@ except Exception:
 mean, std  = ckpt["train_mean"], ckpt["train_std"]
 if isinstance(mean, torch.Tensor): mean = mean.cpu().numpy()
 if isinstance(std, torch.Tensor):  std  = std.cpu().numpy()
-cfg        = ckpt["cfg"]
-assert (ckpt["input_dim"], ckpt["T"], ckpt["M"]) == (24, T, M), "shape mismatch"
+cfg        = dict(ckpt.get("cfg", {}))  # 호환성
+cfg.setdefault("d_model", 64)
+cfg.setdefault("nhead", 8)
+cfg.setdefault("num_layers", 2)
+cfg.setdefault("dim_feedforward", 128)
+cfg.setdefault("dropout", 0.1)
+cfg.setdefault("posenc", "learned")   # "learned" | "sincos" | "rope"
+cfg.setdefault("rope_base", 10000.0)  # RoPE base (체크포인트에 저장되어 있으면 동일값 유지 권장)
+
+assert (ckpt["input_dim"], ckpt["T"], ckpt["M"]) == (24, T, M), "shape mismatch with checkpoint"
 
 # ── Normalize & val split ─────────────────────────────
 X = (X - mean) / std
+torch.manual_seed(seed); np.random.seed(seed)
 ds_all = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
 train_sz = int(0.8 * S); val_sz = S - train_sz
 _, val_ds = random_split(ds_all, [train_sz, val_sz],
                          generator=torch.Generator().manual_seed(seed))
 val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
-# ── Rebuild model ─────────────────────────────────────
-model = FaultDiagnosisTransformer(
-    input_dim=24,
-    d_model=cfg["d_model"], nhead=cfg["nhead"],
-    num_layers=cfg["num_layers"], dim_feedforward=cfg["dim_feedforward"],
-    dropout=cfg["dropout"], output_dim=M, max_seq_len=T
-).to(device)
-model.load_state_dict(ckpt["model_state"])
+# ── Model (with posenc option incl. RoPE) ─────────────────────────────
+def build_model(input_dim, output_dim, max_seq_len, cfg):
+    posenc = cfg.get("posenc", "learned")
+    rope_base = cfg.get("rope_base", 10000.0)
+
+    # ---- RoPE 유틸 ----
+    class RotaryEmbedding(nn.Module):
+        """
+        Precomputes cos,sin tables for RoPE.
+        base: theta base (e.g., 1e4).
+        """
+        def __init__(self, dim: int, max_seq_len: int, base: float = 10000.0):
+            super().__init__()
+            # dim은 per-head 차원(head_dim)
+            inv_freq = base ** (-torch.arange(0, dim, 2, dtype=torch.float32) / dim)  # (dim/2,)
+            t = torch.arange(max_seq_len, dtype=torch.float32)  # (T,)
+            freqs = torch.outer(t, inv_freq)  # (T, dim/2)
+            cos = torch.zeros(max_seq_len, dim)
+            sin = torch.zeros(max_seq_len, dim)
+            cos[:, 0::2] = torch.cos(freqs)
+            sin[:, 0::2] = torch.sin(freqs)
+            cos[:, 1::2] = torch.cos(freqs)
+            sin[:, 1::2] = torch.sin(freqs)
+            self.register_buffer("cos_cached", cos, persistent=False)
+            self.register_buffer("sin_cached", sin, persistent=False)
+
+        def get_cos_sin(self, T: int):
+            return self.cos_cached[:T], self.sin_cached[:T]
+
+    def apply_rotary(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        """
+        q,k: (B, H, T, D)
+        cos,sin: (T, D)
+        """
+        cos = cos.unsqueeze(0).unsqueeze(0)  # (1,1,T,D)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+
+        def rotate(x):
+            x_even = x[..., 0::2]
+            x_odd  = x[..., 1::2]
+            x_rot_even = x_even * cos[..., 0::2] - x_odd * sin[..., 0::2]
+            x_rot_odd  = x_odd  * cos[..., 1::2] + x_even * sin[..., 1::2]
+            out = torch.empty_like(x)
+            out[..., 0::2] = x_rot_even
+            out[..., 1::2] = x_rot_odd
+            return out
+
+        return rotate(q), rotate(k)
+
+    class RotaryEncoderLayer(nn.Module):
+        """ RoPE 적용한 Transformer Encoder Layer (batch_first=True) """
+        def __init__(self, d_model, nhead, dim_feedforward, dropout, activation="relu", norm_first=True,
+                     max_seq_len=1024, base=10000.0):
+            super().__init__()
+            assert d_model % nhead == 0, "d_model must be divisible by nhead for RoPE"
+            self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+            self.linear1 = nn.Linear(d_model, dim_feedforward)
+            self.dropout = nn.Dropout(dropout)
+            self.linear2 = nn.Linear(dim_feedforward, d_model)
+            self.norm_first = norm_first
+            self.norm1 = nn.LayerNorm(d_model)
+            self.norm2 = nn.LayerNorm(d_model)
+            self.dropout1 = nn.Dropout(dropout)
+            self.dropout2 = nn.Dropout(dropout)
+            self.act = nn.ReLU() if activation == "relu" else nn.GELU()
+
+            self.nhead = nhead
+            self.head_dim = d_model // nhead
+            self.rotary = RotaryEmbedding(self.head_dim, max_seq_len=max_seq_len, base=base)
+
+        def _mha_block(self, x):
+            # x: (B,T,D)
+            B, T, D = x.size()
+            H = self.nhead
+            Hd = self.head_dim
+
+            W = self.self_attn.in_proj_weight    # (3D, D)
+            b = self.self_attn.in_proj_bias      # (3D,)
+            # q, k, v projection
+            q_proj = torch.addmm(b[:D],     x.view(-1, D), W[:D, :].t()).view(B, -1, D)
+            k_proj = torch.addmm(b[D:2*D],  x.view(-1, D), W[D:2*D, :].t()).view(B, -1, D)
+            v_proj = torch.addmm(b[2*D:],   x.view(-1, D), W[2*D:, :].t()).view(B, -1, D)
+
+            def shape(xp):
+                return xp.view(B, -1, H, Hd).transpose(1, 2)  # (B,H,T,Hd)
+
+            q = shape(q_proj)
+            k = shape(k_proj)
+            v = shape(v_proj)
+
+            cos, sin = self.rotary.get_cos_sin(T)  # (T,Hd)
+            q_rot, k_rot = apply_rotary(q, k, cos, sin)
+
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q_rot, k_rot, v,
+                dropout_p=self.self_attn.dropout.p if self.training else 0.0
+            )  # (B,H,T,Hd)
+
+            attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, D)  # (B,T,D)
+            out = self.self_attn.out_proj(attn_output)                             # (B,T,D)
+            return out
+
+        def _ff_block(self, x):
+            return self.linear2(self.dropout(self.act(self.linear1(x))))
+
+        def forward(self, src: torch.Tensor):
+            if self.norm_first:
+                x = src + self.dropout1(self._mha_block(self.norm1(src)))
+                x = x   + self.dropout2(self._ff_block(self.norm2(x)))
+            else:
+                x = self.norm1(src + self.dropout1(self._mha_block(src)))
+                x = self.norm2(x   + self.dropout2(self._ff_block(x)))
+            return x
+
+    # ---- 공통 모델 정의 ----
+    class FaultDiagnosisTransformer(nn.Module):
+        def __init__(
+            self,
+            input_dim: int = 24,
+            d_model: int = 64,
+            nhead: int = 8,
+            num_layers: int = 2,
+            dim_feedforward: int = 128,
+            dropout: float = 0.1,
+            output_dim: int = 8,
+            max_seq_len: int = 1000,
+            posenc: str = "learned",  # "learned" | "sincos" | "rope"
+            rope_base: float = 10000.0,
+        ):
+            super().__init__()
+            self.max_seq_len = max_seq_len
+            self.d_model = d_model
+            self.posenc = posenc
+
+            self.input_proj = nn.Linear(input_dim, d_model)
+
+            if posenc == "learned":
+                self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
+                nn.init.normal_(self.pos_embedding, std=0.02)
+                self.use_additive_pos = True
+                enc_layer = nn.TransformerEncoderLayer(
+                    d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+                    dropout=dropout, activation="relu", batch_first=True, norm_first=True
+                )
+                self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers, norm=nn.LayerNorm(d_model))
+            elif posenc == "sincos":
+                pe = torch.zeros(max_seq_len, d_model, dtype=torch.float32)
+                position = torch.arange(0, max_seq_len, dtype=torch.float32).unsqueeze(1)
+                div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+                pe[:, 0::2] = torch.sin(position * div_term)
+                pe[:, 1::2] = torch.cos(position * div_term)
+                pe = pe.unsqueeze(0)
+                self.register_buffer("pos_embedding", pe, persistent=False)
+                self.use_additive_pos = True
+                enc_layer = nn.TransformerEncoderLayer(
+                    d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+                    dropout=dropout, activation="relu", batch_first=True, norm_first=True
+                )
+                self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers, norm=nn.LayerNorm(d_model))
+            elif posenc == "rope":
+                self.use_additive_pos = False  # RoPE는 additive pos 안씀
+                layers = []
+                for _ in range(num_layers):
+                    layers.append(RotaryEncoderLayer(
+                        d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+                        dropout=dropout, activation="relu", norm_first=True,
+                        max_seq_len=max_seq_len, base=rope_base
+                    ))
+                self.encoder = nn.Sequential(*layers)
+            else:
+                raise ValueError(f"Unknown posenc: {posenc}")
+
+            self.pos_drop = nn.Dropout(dropout)
+
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, output_dim),
+            )
+
+            nn.init.xavier_uniform_(self.input_proj.weight)
+            nn.init.zeros_(self.input_proj.bias)
+            for m in self.head.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.zeros_(m.bias)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            B, T, _ = x.shape
+            if T > self.max_seq_len:
+                raise ValueError(
+                    f"T={T} exceeds max_seq_len={self.max_seq_len}. "
+                    f"Increase max_seq_len when constructing the model."
+                )
+            z = self.input_proj(x) / math.sqrt(self.d_model)  # (B,T,d_model)
+            if self.use_additive_pos:
+                z = z + self.pos_embedding[:, :T, :]
+            z = self.pos_drop(z)
+            z = self.encoder(z)
+            return self.head(z)
+
+    return FaultDiagnosisTransformer(
+        input_dim=input_dim,
+        d_model=cfg["d_model"], nhead=cfg["nhead"],
+        num_layers=cfg["num_layers"], dim_feedforward=cfg["dim_feedforward"],
+        dropout=cfg["dropout"], output_dim=output_dim, max_seq_len=max_seq_len,
+        posenc=posenc, rope_base=rope_base,
+    ).to(device)
+
+model = build_model(24, M, T, cfg)
+# posenc 상이 시 strict=False 로드 (sincos/rope)
+strict_load = True
+if cfg.get("posenc", "learned") != "learned":
+    strict_load = False
+missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=strict_load)
+if not strict_load:
+    print(f"[INFO] Loaded with strict=False. missing={len(missing)}, unexpected={len(unexpected)}")
 model.eval()
 
 # ── Inference ─────────────────────────────────────────
@@ -77,29 +310,19 @@ with torch.no_grad():
         all_pred.append(pred)
         all_true.append(yb.int())
 
-prob = torch.cat(all_prob, 0)   # (N,T,M)  p(normal)
-pred = torch.cat(all_pred, 0)   # (N,T,M)  1=normal,0=fault
-true = torch.cat(all_true, 0)   # (N,T,M)  1=normal,0=fault
-N = true.shape[0]
+prob = torch.cat(all_prob, 0)   # (N,T,M)
+pred = torch.cat(all_pred, 0)   # (N,T,M)
+true = torch.cat(all_true, 0)   # (N,T,M)
+true_np = true.numpy()
+pred_np = pred.numpy()
+N, T, M = true_np.shape
 
-# ======================== 유틸 =========================
-def first_zero_idx(seq_0or1: np.ndarray, min_run: int = 1):
-    """값==0(고장)이 min_run 프레임 이상 연속으로 처음 등장하는 시점. 없으면 None."""
-    if min_run <= 1:
-        return int(np.argmax(seq_0or1 == 0)) if (seq_0or1 == 0).any() else None
-    run = 0
-    for t, v in enumerate(seq_0or1):
-        run = run + 1 if v == 0 else 0
-        if run >= min_run:
-            return t - min_run + 1
-    return None
-
+# ── (선택) 예측 스파이크 억제 ─────────────────────────
 def run_filter_zero_mask(seq_0or1: np.ndarray, min_run: int = 1) -> np.ndarray:
-    """0(고장)이 연속 min_run 이상인 구간만 True로 인정하는 마스크."""
     if min_run <= 1:
         return (seq_0or1 == 0)
-    T = len(seq_0or1)
-    mask = np.zeros(T, dtype=bool)
+    Tlen = len(seq_0or1)
+    mask = np.zeros(Tlen, dtype=bool)
     run = 0
     for t, v in enumerate(seq_0or1):
         run = run + 1 if v == 0 else 0
@@ -107,250 +330,130 @@ def run_filter_zero_mask(seq_0or1: np.ndarray, min_run: int = 1) -> np.ndarray:
             mask[t - min_run + 1 : t + 1] = True
     return mask
 
-def fault_set(mat_TxM: np.ndarray, min_run: int = 1):
-    """(T,M)에서 0(고장)인 모터 ID 집합 반환."""
-    T, M = mat_TxM.shape
-    s = set()
-    for m in range(M):
-        if first_zero_idx(mat_TxM[:, m], min_run=min_run) is not None:
-            s.add(m)
-    return s
+if MIN_RUN_PRED > 1:
+    pred_filt = pred_np.copy()
+    for i in range(N):
+        for m in range(M):
+            mask_fault = run_filter_zero_mask(pred_filt[i, :, m], min_run=MIN_RUN_PRED)
+            pred_filt[i, :, m] = np.where(mask_fault, 0, 1)
+    pred_np = pred_filt
 
-# ============ Top-K 패턴 매칭(다수 패턴) 유틸 =============
-def hamming(a: np.ndarray, b: np.ndarray) -> int:
-    return int(np.sum(a != b))
+# ===================== Frame-wise ALL-motors metrics ======================
+eq_frame = (true_np == pred_np).all(axis=2)   # (N,T) 모든 모터 일치해야 True
+overall_frame_acc      = eq_frame.mean()
+per_sample_frame_acc   = eq_frame.mean(axis=1)
 
-def top_k_patterns_with_tol(mat_TxM: np.ndarray, k=2, tol=0):
-    """
-    행 패턴을 tol 해밍 반경으로 간이 클러스터링하여 카운트.
-    반환: (patterns[list[np.ndarray]], counts[list[int]], coverage[0..1])
-    """
-    T, M = mat_TxM.shape
-    protos = []   # 리스트[(패턴(np.array), count)]
-    for t in range(T):
-        row = mat_TxM[t]
-        assigned = False
-        for idx, (p, c) in enumerate(protos):
-            if hamming(row, p) <= tol:
-                protos[idx] = (p, c+1)
-                assigned = True
-                break
-        if not assigned:
-            protos.append((row.copy(), 1))
-    protos_sorted = sorted(protos, key=lambda pc: pc[1], reverse=True)
-    top = protos_sorted[:k]
-    total = float(T)
-    patterns = [p for p, _ in top]
-    counts   = [c for _, c in top]
-    coverage = sum(counts) / total if total > 0 else 0.0
-    return patterns, counts, coverage
+print("\n==== [Exact-all motors] Frame-wise accuracy ====")
+print(f"Overall frame accuracy (exact-all) : {overall_frame_acc:.4f}")
+print(f"Per-sample mean accuracy           : {per_sample_frame_acc.mean():.4f}")
+print(f"Per-sample median accuracy         : {np.median(per_sample_frame_acc):.4f}")
 
-def equal_pattern_multiset(pats_a, pats_b):
-    """top-k 패턴들을 멀티셋 비교(순서 무시, 중복 허용)."""
-    if len(pats_a) != len(pats_b):
-        return False
-    aa = [tuple(x.tolist()) for x in pats_a]
-    bb = [tuple(x.tolist()) for x in pats_b]
-    from collections import Counter
-    return Counter(aa) == Counter(bb)
+is_fault_frame = (true_np == 0).any(axis=2)
+is_norm_frame  = ~is_fault_frame
+acc_on_fault   = (eq_frame & is_fault_frame).sum() / max(is_fault_frame.sum(), 1)
+acc_on_norm    = (eq_frame & is_norm_frame ).sum() / max(is_norm_frame.sum(), 1)
+print(f"Exact-all on FAULT frames          : {acc_on_fault:.4f}")
+print(f"Exact-all on NORMAL frames         : {acc_on_norm:.4f}")
 
-def first_index_close(mat_TxM: np.ndarray, pattern: np.ndarray, tol: int = 0):
-    """해밍 거리 tol 이내로 일치하는 첫 프레임 인덱스 (없으면 None)."""
-    for t in range(mat_TxM.shape[0]):
-        if hamming(mat_TxM[t], pattern) <= tol:
-            return t
-    return None
+# ================= Shift-tolerant exact-all (지연 관용) ===================
+def exact_all_with_shift(gt_TxM: np.ndarray, pr_TxM: np.ndarray, max_lag: int):
+    T, M = gt_TxM.shape
+    best_acc, best_lag = 0.0, 0
+    for lag in range(-max_lag, max_lag + 1):
+        if lag < 0:
+            pr_slice = pr_TxM[-lag:, :]
+            gt_slice = gt_TxM[:T+lag, :]
+        elif lag > 0:
+            pr_slice = pr_TxM[:T-lag, :]
+            gt_slice = gt_TxM[lag:, :]
+        else:
+            pr_slice = pr_TxM
+            gt_slice = gt_TxM
+        if pr_slice.size == 0:
+            continue
+        eq = (gt_slice == pr_slice).all(axis=1)  # (T') 프레임별 전체-모터 일치
+        acc = eq.mean()
+        if acc > best_acc:
+            best_acc, best_lag = acc, lag
+    return best_acc, best_lag
 
-# ======================================================
-# A) 마이크로 지표(AUROC/AUPRC/F1) — 양성=고장으로 계산
-prob_fault = (1.0 - prob).view(-1).numpy()          # 양성=고장 확률
-true_fault = (1 - true).view(-1).numpy()            # 1=고장, 0=정상
-pred_fault = (1 - pred).view(-1).numpy()            # 1=고장, 0=정상
-
-try:
-    auroc_micro = roc_auc_score(true_fault, prob_fault)
-except ValueError:
-    auroc_micro = np.nan
-auprc_micro = average_precision_score(true_fault, prob_fault)
-f1_micro    = f1_score(true_fault, pred_fault, average="micro", zero_division=0)
-
-print("\n==== Micro metrics (positive = FAULT) ====")
-print(f"AUROC  : {auroc_micro:.4f}")
-print(f"AUPRC  : {auprc_micro:.4f}")
-print(f"F1@0.5 : {f1_micro:.4f}")
-
-# ======================================================
-# B) 이벤트 지표(모터 단위 TP/FP/FN) + Delay(성공 탐지만)
-tp = fp = fn = 0
-detected_delays = []  # seconds
+MAX_LAG = max(0, int(round(MAX_LAG_SEC / dt)))
+best_accs, best_lags = [], []
 for i in range(N):
-    gt = true[i].numpy()   # 1=정상,0=고장
-    pr = pred[i].numpy()
-    for m in range(M):
-        gt_seq = gt[:, m]; pr_seq = pr[:, m]
-        if 0 in gt_seq:                      # 실제 고장
-            t_true = int(np.argmax(gt_seq == 0))
-            if 0 in pr_seq:                  # 해당 모터 탐지
-                t_pred = int(np.argmax(pr_seq == 0))
+    acc_i, lag_i = exact_all_with_shift(true_np[i], pred_np[i], MAX_LAG)
+    best_accs.append(acc_i); best_lags.append(lag_i)
+
+print("\n==== [Shift-tolerant] Exact-all motors (per frame) ====")
+print(f"Best-acc (mean over samples)       : {np.mean(best_accs):.4f}")
+print(f"Best-acc (median over samples)     : {np.median(best_accs):.4f}")
+if MAX_LAG > 0:
+    lags_sec = np.array(best_lags) * dt
+    print(f"Best lag (sec) mean/median         : {lags_sec.mean():.4f} / {np.median(lags_sec):.4f}")
+    pct_zero = np.mean(np.array(best_lags) == 0) * 100.0
+    print(f"Best lag == 0 frame (%)            : {pct_zero:.2f}%")
+
+# ======================= Sequence onset (전체 모터 기준) ===================
+def first_fault_onset(mat_TxM: np.ndarray):
+    fault_any = (mat_TxM == 0).any(axis=1)  # (T,)
+    return int(np.argmax(fault_any)) if fault_any.any() else None
+
+PRE_TOL  = int(round(PRE_TOL_SEC  / dt))
+POST_TOL = int(round(POST_TOL_SEC / dt))
+
+tp = fp = fn = 0
+delays = []  # seconds (TP만)
+for i in range(N):
+    t_true = first_fault_onset(true_np[i])   # None이면 완전 정상 시퀀스
+    t_pred = first_fault_onset(pred_np[i])
+    if t_true is None:
+        if t_pred is not None:
+            fp += 1
+    else:
+        if t_pred is None:
+            fn += 1
+        else:
+            if (t_pred >= t_true - PRE_TOL) and (t_pred <= t_true + POST_TOL):
                 tp += 1
-                detected_delays.append(max(t_pred - t_true, 0) * dt)
+                delays.append(max(t_pred - t_true, 0) * dt)
             else:
                 fn += 1
-        else:
-            if 0 in pr_seq:
-                fp += 1
 
-precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-f1_event  = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0.0
+prec = tp / (tp + fp) if (tp + fp) else 0.0
+rec  = tp / (tp + fn) if (tp + fn) else 0.0
+f1_onset = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0
 
-print("\n==== [Event-level] motor-wise detection ====")
-print(f"TP events: {tp} / {tp + fn}")
-print(f"Precision={precision:.4f}  Recall={recall:.4f}  F1={f1_event:.4f}")
+print("\n==== [Onset (any-motor)] Sequence-level detection with tolerance ====")
+print(f"Precision={prec:.4f}  Recall={rec:.4f}  F1={f1_onset:.4f}")
+if delays:
+    d = np.array(delays)
+    print(f"Onset delay (TP only) mean/median  : {d.mean():.4f}s / {np.median(d):.4f}s (n={len(d)})")
 
-if detected_delays:
-    d = np.array(detected_delays)
-    print(f"Delay (TP only) → mean={d.mean():.4f}s, median={np.median(d):.4f}s, n={len(d)}")
-else:
-    print("Delay: (no TP)")
-
-# ======================================================
-# C) Strict 샘플 정확도 (모터 ID 집합 완전 일치, 시간 무시)
-MIN_RUN_PRED = 1  # 예측 스파이크 억제 원하면 2~3으로
-strict_ok = 0
-for i in range(N):
-    gt = true[i].numpy(); pr = pred[i].numpy()
-    gt_set = fault_set(gt, min_run=1)
-    pr_set = fault_set(pr, min_run=MIN_RUN_PRED)
-    if gt_set == pr_set:
-        strict_ok += 1
-print("\n==== [Strict] sample accuracy (ID set equality) ====")
-print(f"Strict acc: {strict_ok}/{N} = {strict_ok/max(N,1):.4f}")
-
-# ======================================================
-# D) Lenient 샘플 정확도 (고장 구간 90% 이상 맞추면 성공) + Delay(성공만)
-TAU_RECALL   = 0.90   # 90% 규칙
-MAX_FP_RATE  = 0.10   # 정상 프레임 FP율 제한(끄려면 None)
-MIN_RUN_PRED = 1      # 예측 스파이크 억제
-
-lenient_ok = 0
-lenient_delays = []
-
-for i in range(N):
-    gt = true[i].numpy(); pr = pred[i].numpy()
-    gt_fault_motors = [m for m in range(M) if (gt[:, m] == 0).any()]
-    if not gt_fault_motors:
-        continue
-
-    # 모터별 시간 기반 recall
-    recalls = []
-    per_motor_delays = []
-    for m in gt_fault_motors:
-        gt_fault_mask = (gt[:, m] == 0)
-        pr_fault_mask = run_filter_zero_mask(pr[:, m], MIN_RUN_PRED)
-        denom = gt_fault_mask.sum()
-        if denom == 0:
-            continue
-        recalls.append(((gt_fault_mask & pr_fault_mask).sum()) / denom)
-
-        t_true = first_zero_idx(gt[:, m], 1)
-        t_pred = first_zero_idx(pr[:, m], MIN_RUN_PRED)
-        if t_true is not None and t_pred is not None:
-            per_motor_delays.append(max(t_pred - t_true, 0) * dt)
-
-    if not recalls:
-        continue
-    mean_rec = float(np.mean(recalls))
-
-    fp_ok = True
-    if MAX_FP_RATE is not None:
-        gt_normal_mask = (gt == 1)
-        pr_fault_mask_all = np.stack(
-            [run_filter_zero_mask(pr[:, m], MIN_RUN_PRED) for m in range(M)], axis=1
-        )
-        fp_num = (pr_fault_mask_all & gt_normal_mask).sum()
-        fp_den = gt_normal_mask.sum()
-        fp_rate = fp_num / max(fp_den, 1)
-        fp_ok = (fp_rate <= MAX_FP_RATE)
-
-    if (mean_rec >= TAU_RECALL) and fp_ok:
-        lenient_ok += 1
-        lenient_delays.extend(per_motor_delays)
-
-print("\n==== [Lenient] sample accuracy (≥90% time coverage) ====")
-print(f"Lenient acc: {lenient_ok}/{N} = {lenient_ok/max(N,1):.4f}")
-if lenient_delays:
-    d = np.array(lenient_delays)
-    print(f"Lenient delay (success only) → mean={d.mean():.4f}s, median={np.median(d):.4f}s, n={len(lenient_delays)}")
-else:
-    print("Lenient delay: (no lenient successes)")
-
-# ======================================================
-# E) Delay 분포 히스토그램 (TP 기준) ─ 0~0.2s 구간 비율
-if detected_delays:
-    d = np.array(detected_delays)
-    counts, bins = np.histogram(d, bins=50, range=(0.0, 0.2))
-    pct = counts / len(d) * 100.0
-
-    plt.figure(figsize=(6,4))
-    plt.bar(bins[:-1], pct, width=(bins[1]-bins[0]), edgecolor='black', align='edge')
-    plt.axvline(0.05, linestyle='--', label='0.05s')
-    plt.axvline(0.10, linestyle='--', label='0.10s')
-    plt.axvline(0.20, linestyle='--', label='0.20s')
-    plt.xlabel('Detection Delay (s)'); plt.ylabel('Percentage of Cases (%)')
-    plt.title('Detection Delay Distribution (TP only, 0–0.2s)')
-    plt.legend(); plt.grid(True, linestyle='--', alpha=0.6); plt.tight_layout()
-    save_path_pct = os.path.join(repo_root, "delay_hist_percentage.png")
-    plt.savefig(save_path_pct, dpi=300)
-    print(f"\n📁 Percentage histogram saved to: {save_path_pct}")
-
-    within_005 = np.mean(d <= 0.05); within_010 = np.mean(d <= 0.10); within_020 = np.mean(d <= 0.20)
-    print(f"⏱ Delay ≤ 0.05s : {within_005*100:.2f}%")
-    print(f"⏱ Delay ≤ 0.10s : {within_010*100:.2f}%")
-    print(f"⏱ Delay ≤ 0.20s : {within_020*100:.2f}%")
-else:
-    print("\n(No TP delays to plot)")
-
-# ======================================================
-# F) Majority Top-2 패턴 매칭 정확도 + Delay(성공만)
-TOP_K = 2
-HAMMING_TOL = 0     # 패턴 허용 해밍 거리(작은 오류 흡수). 0~2 권장
-COVERAGE_TAU = 0.8  # top-2 패턴이 전체 프레임의 80% 이상을 덮어야 유효
-
+# ======================= Majority Top-2 패턴 매칭 =========================
 def hamming(a: np.ndarray, b: np.ndarray) -> int:
     return int(np.sum(a != b))
 
 def top_k_patterns_with_tol(mat_TxM: np.ndarray, k=2, tol=0):
-    """
-    행 패턴을 tol 해밍 반경으로 간이 클러스터링하여 카운트.
-    반환: (patterns[list[np.ndarray]], counts[list[int]], coverage[0..1])
-    """
-    T, M = mat_TxM.shape
-    protos = []   # 리스트[(패턴(np.array), count)]
-    for t in range(T):
+    Tlen, Mdim = mat_TxM.shape
+    protos = []  # (pattern, count)
+    for t in range(Tlen):
         row = mat_TxM[t]
         assigned = False
         for idx, (p, c) in enumerate(protos):
             if hamming(row, p) <= tol:
-                protos[idx] = (p, c+1)
+                protos[idx] = (p, c + 1)
                 assigned = True
                 break
         if not assigned:
             protos.append((row.copy(), 1))
     protos_sorted = sorted(protos, key=lambda pc: pc[1], reverse=True)
     top = protos_sorted[:k]
-    total = float(T)
+    total = float(Tlen)
     patterns = [p for p, _ in top]
     counts   = [c for _, c in top]
     coverage = (sum(counts) / total) if total > 0 else 0.0
     return patterns, counts, coverage
 
 def can_match_topk(pats_a, pats_b, tol=0):
-    """
-    pats_a, pats_b: list[np.ndarray] (길이 동일)
-    해밍 거리 ≤ tol 조건으로 1:1 매칭이 모두 성립하면 True.
-    (순서 무시, 카운트는 이미 top-k에 반영되었다고 보고 패턴 내용만 매칭)
-    """
     if len(pats_a) != len(pats_b):
         return False
     used = [False] * len(pats_b)
@@ -366,42 +469,33 @@ def can_match_topk(pats_a, pats_b, tol=0):
     return True
 
 def first_index_close(mat_TxM: np.ndarray, pattern: np.ndarray, tol: int = 0):
-    """해밍 거리 tol 이내로 일치하는 첫 프레임 인덱스 (없으면 None)."""
     for t in range(mat_TxM.shape[0]):
         if hamming(mat_TxM[t], pattern) <= tol:
             return t
     return None
 
 maj_ok = 0
-maj_delays = []  # seconds
-
+maj_delays = []
 for i in range(N):
-    gt = true[i].numpy()   # (T,M)
-    pr = pred[i].numpy()
-
+    gt = true_np[i]; pr = pred_np[i]
     gt_pats, gt_cnts, gt_cov = top_k_patterns_with_tol(gt, k=TOP_K, tol=HAMMING_TOL)
     pr_pats, pr_cnts, pr_cov = top_k_patterns_with_tol(pr, k=TOP_K, tol=HAMMING_TOL)
 
-    # 커버리지 낮으면 노이즈가 많다고 보고 실패 처리(원하면 완화 가능)
     if (gt_cov < COVERAGE_TAU) or (pr_cov < COVERAGE_TAU):
         continue
 
-    # 최다 top-k 패턴이 tol 이내에서 1:1 매칭되면 정답
     if can_match_topk(gt_pats, pr_pats, tol=HAMMING_TOL):
         maj_ok += 1
 
-        # Delay: "고장 패턴"(행에 0이 하나라도 있는 패턴)을 찾아 첫 등장 시점 차이
         def pick_fault_pattern(pats, cnts):
             idxs = [idx for idx, p in enumerate(pats) if (p == 0).any()]
             if not idxs:
                 return None, None
-            # 고장 패턴 중에서 카운트가 가장 큰 것을 대표로 선택
             best = max(idxs, key=lambda j: cnts[j])
             return pats[best], cnts[best]
 
         gt_fault_pat, _ = pick_fault_pattern(gt_pats, gt_cnts)
         pr_fault_pat, _ = pick_fault_pattern(pr_pats, pr_cnts)
-
         if gt_fault_pat is not None and pr_fault_pat is not None:
             t_true = first_index_close(gt, gt_fault_pat, tol=HAMMING_TOL)
             t_pred = first_index_close(pr, pr_fault_pat, tol=HAMMING_TOL)
