@@ -1,8 +1,8 @@
 import os
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import multiprocessing as mp
 import sys, io, time, contextlib
@@ -279,20 +279,17 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
     dq_des  = np.clip(dq_des,  -100.0,  100.0)
     ddq_des = np.clip(ddq_des, -100.0, 100.0)
 
-    # ---------------- 컨트롤러/분배기 ----------------
     impedance_controller = ImpedanceControllerMaximal(model_param['ODAR'][-1])
     external_controller = ExternalActuation(model_param, robot)
     external_controller.apply_selective_mapping = False  # 우선 False로 검증
 
-    # ---------------- 고장 계획(라벨만 미리 뽑기) ----------------
-    # 주의: 여기서는 라벨 스케줄만 필요. lam_faulty는 쓰지 않는다.
+
     lam_dummy = np.zeros((T, 8*link_count))
     _, type_matrix, label_matrix, t0, idx, which_mask, onset_idx = inject_faults(
         lam_dummy, epsilon_scale=epsilon_scale, return_labels=True
     )
 
-    # ---------------- 단 한 번의 폐루프 시뮬레이션 ----------------
-    lam_log = np.zeros((T, 8*link_count))  # 실제 적용된 추력 로그(고장 반영)
+    lam_log = np.zeros((T, 8*link_count))  
     actual_q  = np.zeros((T, dof, 1))
     actual_dq = np.zeros_like(actual_q)
     actual_q[0] = q_des[0]
@@ -302,45 +299,34 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
     impedance_controller.set_desired_pose(T_des_series[0])
 
     for t in range(1, T):
-        # (1) 현재 실제 상태 기준
         q = actual_q[t-1]; dq = actual_dq[t-1]
         robot.set_joint_states(q, dq)
         T_act = fk_solver.compute_end_effector_frame(q[:, 0])
         R_EF  = T_act[:3, :3]
 
-        # (2) Joint-space PD + Gravity compensation
         q_ref  = q_des[t]          # (dof,1)
         dq_ref = dq_des[t]         # (dof,1)
 
-        # 게인은 상황 맞춰 조절 (너무 크면 진동, 너무 작으면 오차)
         Mjj = np.diag(robot.Mass)  # (dof,)
         fn, zeta = 2.5, 0.9        # 자연주파수 약 2.5 Hz, 감쇠 0.9
         wn = 2*np.pi*fn
-        Kp_vec = (wn**2) * Mjj     # ≈ 246 * Mjj
-        Kd_vec = (2*zeta*wn) * Mjj # ≈ 28 * Mjj
+        Kp_vec = (wn**2) * Mjj     
+        Kd_vec = (2*zeta*wn) * Mjj 
 
-        # 루프 안
         e  = (q_ref - q).reshape(-1)
         de = (dq_ref - dq).reshape(-1)
         tau = (Kp_vec*e + Kd_vec*de) + robot.Grav.reshape(-1)
 
-        # 안전하게 토크 클립 (분배기의 가용 추력 한계 고려)
         tau = np.clip(tau, -200000.0, 200000.0)
-
-
-        # (6) 추력 분배 (LP→LS 폴백)
         lam_cmd = external_controller.distribute_torque_lp(tau)
 
-        # === 노이즈 스케일 설정 ===
-        # epsilon_scale: CLI 입력(예: 0.01 → 1% 표준편차)
-        eps_norm  = float(epsilon_scale)        # 정상 모터 노이즈 비율
-        eps_fault = float(epsilon_scale)        # 고장 모터 노이즈 비율(원하면 따로 크게)
+        eps_norm  = float(epsilon_scale)       
+        eps_fault = float(epsilon_scale)       
 
-        # === 모든 모터에 기본 노이즈 추가 ===
         ref = np.abs(lam_cmd) + 1e-9
         noise_all = np.random.normal(0.0, eps_norm, size=lam_cmd.shape) * ref
 
-        lam_apply = lam_cmd + noise_all  # 항상 노이즈 적용
+        lam_apply = lam_cmd + noise_all  
 
         # === 고장 모터: scale*lambda + noise 로 덮어쓰기 ===
         faulty = (label_matrix[t] == 0)
@@ -349,11 +335,8 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
             scale_fault = 0
             noise_fault = np.random.normal(0.0, eps_fault, size=lam_cmd.shape) * ref
             lam_apply[faulty] = scale_fault * lam_cmd[faulty] + noise_fault[faulty]
-
         lam_log[t] = lam_apply
 
-
-        # (8) 실제 로봇에 적용 → 다음 상태 적분
         for i in range(link_count):
             thrust_i = lam_apply[8*i:8*(i+1)].reshape(-1, 1)
             robot.set_odar_body_wrench_from_thrust(thrust_i, i)
@@ -368,8 +351,6 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
         robot.set_joint_states(qn, dqn)
         fk_actual.append(fk_solver.compute_end_effector_frame(qn[:, 0]))
 
-    # ---------------- 결과 패킹 ----------------
-    # "desired"는 IK로 평활화한 q_des의 FK(학습 목표 포즈)로 두는 게 일관됨
     desired_np = np.stack([fk_solver.compute_end_effector_frame(q_des[t, :, 0]) for t in range(T)])
     actual_np  = np.stack(fk_actual)
     label      = label_matrix  # (T, 8*link_count)
@@ -422,11 +403,9 @@ def generate_dataset_parallel(link_count, T, NUM_SAMPLES, dt, epsilon_scale, wor
                 _progress_bar(done_cnt, NUM_SAMPLES, prefix="Generating samples", start_time=start_time)
 
         except KeyboardInterrupt:
-            # 남은 작업 취소하고 지금까지의 결과를 partial로 반환
             ex.shutdown(cancel_futures=True)
             print("\nInterrupted. Returning partial results...")
             if len(desired_list) == 0:
-                # 아무 것도 쌓이지 않았다면 빈 결과를 partial로 리턴
                 return (
                     np.empty((0,)), np.empty((0,)), np.empty((0,)),
                     np.empty((0,)), np.empty((0,)), np.empty((0,), dtype=np.int32),
@@ -441,7 +420,6 @@ def generate_dataset_parallel(link_count, T, NUM_SAMPLES, dt, epsilon_scale, wor
             t0_arr    = np.asarray(t0_list, dtype=np.int32)  # (S_partial,)
             return desired, actual, label, which_fault_mask, onset_idx, t0_arr, True  # partial
 
-    # 정상 완료 시
     desired = np.asarray(desired_list)
     actual  = np.asarray(actual_list)
     label   = np.asarray(label_list)

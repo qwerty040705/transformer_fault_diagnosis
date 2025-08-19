@@ -21,7 +21,6 @@ print(f"actual.shape  = {actual.shape}")
 print(f"label.shape   = {label.shape} (motor_count={motor_count})")
 
 
-# 안전한 time index 목록 (데이터 길이에 맞춰 자동 클램프)
 raw_times = [0, 1, 10, 50, 100, 150, 200, 250, 500, 750, 800, 999]
 time_idx_list = [t for t in raw_times if t < T]
 
@@ -31,32 +30,27 @@ def decompose_se3(T4):
     return R, p
 
 def rot_angle(R_err):
-    # 회전행렬 → 회전각 (라디안). 수치안정 위해 trace 클립
     tr = np.clip((np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0)
     return float(np.arccos(tr))
 
-sample_idx = 1
+sample_idx = 0
 assert 0 <= sample_idx < S, "sample_idx out of range"
 
 for time_idx in time_idx_list:
     print("\n" + "="*50)
     print(f"[Sample {sample_idx}, Time {time_idx}]")
 
-    # 라벨 (정수로 보기 좋게)
     lbl = label[sample_idx, time_idx].astype(int)
     print("Motor labels:", lbl)
 
-    # 분해
     T_des = desired[sample_idx, time_idx]
     T_act = actual[sample_idx, time_idx]
     R_des, p_des = decompose_se3(T_des)
     R_act, p_act = decompose_se3(T_act)
 
-    # 원본 SE(3) 그대로 보여주기
     print("\nDesired SE(3):\n", T_des)
     print("\nActual  SE(3):\n", T_act)
 
-    # 오차 계산
     pos_err = np.linalg.norm(p_act - p_des)                     # [m]
     R_err   = R_des.T @ R_act                                   # des→act
     ang_err = rot_angle(R_err)                                   # [rad]
