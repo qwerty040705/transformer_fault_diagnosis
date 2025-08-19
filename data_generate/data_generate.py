@@ -1,4 +1,11 @@
-import sys, os, io, time, contextlib
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+import multiprocessing as mp
+import sys, io, time, contextlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -15,6 +22,9 @@ except Exception:
     from fault_injection import inject_faults
 from parameters import get_parameters
 from parameters_model import parameters_model
+
+from control.impedance_controller import ImpedanceControllerMaximal
+from control.external_actuation import ExternalActuation
 
 
 # ---------------- Utils ----------------
@@ -106,6 +116,15 @@ def align_z_to(vec_z):
     x = np.cross(y, z)
     Rm = np.stack([x, y, z], axis=1)
     return R.from_matrix(Rm)
+# === NEW: x축을 vec_x 방향에 정렬 ===
+def align_x_to(vec_x):
+    x = vec_x / (np.linalg.norm(vec_x) + 1e-12)
+    ref = np.array([0.0, 0.0, 1.0]) if abs(x[2]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    z0 = np.cross(x, ref); z0 /= (np.linalg.norm(z0) + 1e-12)
+    y0 = np.cross(z0, x)
+    Rm = np.stack([x, y0, z0], axis=1)  # 열이 [x, y, z]
+    return R.from_matrix(Rm)
+
 
 def sample_on_cone(axis, alpha_max):
     u = random_unit()
@@ -169,7 +188,6 @@ def generate_random_se3_series(
 
             # ---------------- orientation --------------
             if n == 1:
-                # EE z축을 p̂로 정렬하고, 그 축에 대한 roll만 허용
                 roll = np.random.uniform(-max_rot_step, max_rot_step)
                 R_new = align_z_to(p_cand / ℓ) * R.from_rotvec(np.array([0, 0, roll]))
 
@@ -221,7 +239,7 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
     if seed is not None:
         np.random.seed(seed)
 
-    # model params
+    # ---------------- 모델 파라미터/객체 ----------------
     base_param = get_parameters(link_count)
     base_param['ODAR'] = base_param['ODAR'][:link_count]
     screw_axes, inertias = [], []
@@ -241,14 +259,13 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
     dof       = model_param['LASDRA']['dof']
     link_len  = float(model_param['ODAR'][0].length)
 
-    # desired SE(3) trajectory
+    # ---------------- 원하는 SE3 궤적 & IK ----------------
     q0 = (np.random.rand(dof, 1) * 2 - 1) * 0.5 * np.pi
     T_des_series = generate_random_se3_series(
         fk_solver, q0, link_count, link_len, T=T,
         max_pos_step=0.001, max_rot_step=0.001
     )
 
-    # IK forward propagate
     q_des  = np.zeros((T, dof, 1))
     dq_des = np.zeros_like(q_des)
     ddq_des= np.zeros_like(q_des)
@@ -259,55 +276,106 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
         q_des[t]   = q_des[t-1] + dt * dq_tmp
         dq_des[t]  = dq_tmp
         ddq_des[t] = (dq_des[t] - dq_des[t-1]) / dt
-    dq_des  = np.clip(dq_des,  -5.0,  5.0)
-    ddq_des = np.clip(ddq_des, -20.0, 20.0)
+    dq_des  = np.clip(dq_des,  -100.0,  100.0)
+    ddq_des = np.clip(ddq_des, -100.0, 100.0)
 
-    # desired thrust λ
-    D_use = robot.D[:6*link_count]
-    B_use = robot.B_blkdiag[:6*link_count, :8*link_count]
-    H = D_use.T @ B_use
-    lam_des = np.zeros((T, 8*link_count))
-    for t in range(T):
-        robot.set_joint_states(q_des[t], dq_des[t])
-        tau = robot.Mass @ ddq_des[t] + robot.Cori @ dq_des[t] + robot.Grav
-        lam_des[t] = np.clip(
-            solve_lambda_damped(H, tau).ravel(),
-            -1.5*getattr(robot, "max_thrust", 100.0),
-             1.5*getattr(robot, "max_thrust", 100.0)
-        )
+    # ---------------- 컨트롤러/분배기 ----------------
+    impedance_controller = ImpedanceControllerMaximal(model_param['ODAR'][-1])
+    external_controller = ExternalActuation(model_param, robot)
+    external_controller.apply_selective_mapping = False  # 우선 False로 검증
 
-    # ----------- fault injection --------
-    # 7개 반환값 모두 수신 (lam_faulty, type_matrix, label_TxM, t0, idx, which_mask, onset_idx)
-    lam_faulty, type_matrix, label_matrix, t0, idx, which_mask, onset_idx = inject_faults(
-        lam_des, epsilon_scale=epsilon_scale, return_labels=True
+    # ---------------- 고장 계획(라벨만 미리 뽑기) ----------------
+    # 주의: 여기서는 라벨 스케줄만 필요. lam_faulty는 쓰지 않는다.
+    lam_dummy = np.zeros((T, 8*link_count))
+    _, type_matrix, label_matrix, t0, idx, which_mask, onset_idx = inject_faults(
+        lam_dummy, epsilon_scale=epsilon_scale, return_labels=True
     )
 
-    # ----------- forward dynamics --------
-    actual_q = np.zeros_like(q_des)
-    actual_dq = np.zeros_like(dq_des)
+    # ---------------- 단 한 번의 폐루프 시뮬레이션 ----------------
+    lam_log = np.zeros((T, 8*link_count))  # 실제 적용된 추력 로그(고장 반영)
+    actual_q  = np.zeros((T, dof, 1))
+    actual_dq = np.zeros_like(actual_q)
     actual_q[0] = q_des[0]
     robot.set_joint_states(actual_q[0], np.zeros_like(actual_q[0]))
-    fk_actual = [fk_solver.compute_end_effector_frame(actual_q[0, :, 0])]
+    fk_actual = [fk_solver.compute_end_effector_frame(actual_q[0][:, 0])]
+
+    impedance_controller.set_desired_pose(T_des_series[0])
+
     for t in range(1, T):
-        thrust = lam_faulty[t].reshape(-1, 1)
-        tau_flt = D_use.T @ (B_use @ thrust)
-        q, dq = actual_q[t-1], actual_dq[t-1]
+        # (1) 현재 실제 상태 기준
+        q = actual_q[t-1]; dq = actual_dq[t-1]
         robot.set_joint_states(q, dq)
-        nxt = robot.get_next_joint_states(dt, tau_flt)
+        T_act = fk_solver.compute_end_effector_frame(q[:, 0])
+        R_EF  = T_act[:3, :3]
+
+        # (2) Joint-space PD + Gravity compensation
+        q_ref  = q_des[t]          # (dof,1)
+        dq_ref = dq_des[t]         # (dof,1)
+
+        # 게인은 상황 맞춰 조절 (너무 크면 진동, 너무 작으면 오차)
+        Mjj = np.diag(robot.Mass)  # (dof,)
+        fn, zeta = 2.5, 0.9        # 자연주파수 약 2.5 Hz, 감쇠 0.9
+        wn = 2*np.pi*fn
+        Kp_vec = (wn**2) * Mjj     # ≈ 246 * Mjj
+        Kd_vec = (2*zeta*wn) * Mjj # ≈ 28 * Mjj
+
+        # 루프 안
+        e  = (q_ref - q).reshape(-1)
+        de = (dq_ref - dq).reshape(-1)
+        tau = (Kp_vec*e + Kd_vec*de) + robot.Grav.reshape(-1)
+
+        # 안전하게 토크 클립 (분배기의 가용 추력 한계 고려)
+        tau = np.clip(tau, -200000.0, 200000.0)
+
+
+        # (6) 추력 분배 (LP→LS 폴백)
+        lam_cmd = external_controller.distribute_torque_lp(tau)
+
+        # === 노이즈 스케일 설정 ===
+        # epsilon_scale: CLI 입력(예: 0.01 → 1% 표준편차)
+        eps_norm  = float(epsilon_scale)        # 정상 모터 노이즈 비율
+        eps_fault = float(epsilon_scale)        # 고장 모터 노이즈 비율(원하면 따로 크게)
+
+        # === 모든 모터에 기본 노이즈 추가 ===
+        ref = np.abs(lam_cmd) + 1e-9
+        noise_all = np.random.normal(0.0, eps_norm, size=lam_cmd.shape) * ref
+
+        lam_apply = lam_cmd + noise_all  # 항상 노이즈 적용
+
+        # === 고장 모터: scale*lambda + noise 로 덮어쓰기 ===
+        faulty = (label_matrix[t] == 0)
+        if np.any(faulty):
+            # scale=0 → stuck-off(+노이즈만), scale=1 → 정상(+노이즈)
+            scale_fault = 0
+            noise_fault = np.random.normal(0.0, eps_fault, size=lam_cmd.shape) * ref
+            lam_apply[faulty] = scale_fault * lam_cmd[faulty] + noise_fault[faulty]
+
+        lam_log[t] = lam_apply
+
+
+        # (8) 실제 로봇에 적용 → 다음 상태 적분
+        for i in range(link_count):
+            thrust_i = lam_apply[8*i:8*(i+1)].reshape(-1, 1)
+            robot.set_odar_body_wrench_from_thrust(thrust_i, i)
+        tau_odar = robot.get_joint_torque_from_odars()
+
+        nxt = robot.get_next_joint_states(dt, tau_odar)
         qn, dqn = nxt['q'], np.clip(nxt['dq'], -10.0, 10.0)
         if not (_is_finite(qn) and _is_finite(dqn)):
             qn, dqn = q, dq
+
         actual_q[t], actual_dq[t] = qn, dqn
         robot.set_joint_states(qn, dqn)
         fk_actual.append(fk_solver.compute_end_effector_frame(qn[:, 0]))
 
-    # Desired, Actual 경로와 레이블 반환
-    desired_np = np.stack(T_des_series)
+    # ---------------- 결과 패킹 ----------------
+    # "desired"는 IK로 평활화한 q_des의 FK(학습 목표 포즈)로 두는 게 일관됨
+    desired_np = np.stack([fk_solver.compute_end_effector_frame(q_des[t, :, 0]) for t in range(T)])
     actual_np  = np.stack(fk_actual)
     label      = label_matrix  # (T, 8*link_count)
 
-    # 메타 포함 6개 반환
     return desired_np, actual_np, label, which_mask, onset_idx, int(t0)
+
 
 
 def _worker(args):
@@ -332,8 +400,8 @@ def generate_dataset_parallel(link_count, T, NUM_SAMPLES, dt, epsilon_scale, wor
     start_time = time.time()
     _progress_bar(done_cnt, NUM_SAMPLES, prefix="Generating samples", start_time=start_time)
 
-    # ---- 여기서부터 Ctrl+C(KeyboardInterrupt)를 함수 내부에서 처리 ----
-    with ProcessPoolExecutor(max_workers=workers) as ex:
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
         try:
             futs = [ex.submit(_worker, a) for a in args_list]
             for fut in as_completed(futs):
@@ -416,7 +484,6 @@ if __name__ == '__main__':
     dt = 0.01
     timestamps = np.arange(T) * dt
 
-    # 함수가 partial 여부까지 돌려줌
     desired, actual, label, which_mask, onset_idx, t0_arr, is_partial = generate_dataset_parallel(
         link_count, T, NUM_SAMPLES, dt, epsilon_scale, workers
     )

@@ -71,7 +71,7 @@ def get_parameters(nlinks: int) -> Dict:
     joint_to_com = 0.5 * default_length * np.array([1.0, 0.0, 0.0], dtype=float)
     Ixx, Iyy, Izz = 0.015, 0.1, 0.1
     inertia_matrix = np.diag([Ixx, Iyy, Izz]).astype(float)
-    max_thrust = 8.0
+    max_thrust = 100000
 
     B = np.array([
         [0.6797,  0.6797,  0.6797,  0.6797,  0.6797,  0.6797,  0.6797,  0.6797],
