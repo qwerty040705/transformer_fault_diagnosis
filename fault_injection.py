@@ -38,9 +38,9 @@ def inject_faults(
             raise ValueError("[inject_faults] length must be a multiple of 8.")
         N = M // 8
 
-        # 고장 모터 수 k (0 허용)
+        # 고장 모터 수 k 
         k_raw = rng.poisson(lam=fault_lambda)
-        k = int(np.clip(k_raw, 0, N))
+        k = int(np.clip(k_raw, 1, N))
 
         if k > 0:
             fault_indices = np.sort(rng.choice(M, size=k, replace=False))
@@ -84,9 +84,9 @@ def inject_faults(
             t0 = int(fault_time)
         t0 = max(0, min(T, t0))  # 0 ≤ t0 ≤ T
 
-        # 고장 모터 수 k (0 허용)
+        # 고장 모터 수 k
         k_raw = rng.poisson(lam=fault_lambda)
-        k = int(np.clip(k_raw, 0, N))
+        k = int(np.clip(k_raw, 1, N))
         if k > 0:
             fault_indices = np.sort(rng.choice(M, size=k, replace=False))
         else:
