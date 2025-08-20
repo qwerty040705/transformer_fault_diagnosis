@@ -110,7 +110,7 @@ class FaultDiagnosisTransformer(nn.Module):
         num_layers: int = 2,
         dim_feedforward: int = 128,
         dropout: float = 0.1,
-        output_dim: int = 8,
+        output_dim: int = 16,      ##여기 고침.
         max_seq_len: int = 1000,
         rope_base: float = 10000.0,
     ):
@@ -326,7 +326,7 @@ if __name__ == "__main__":
     print("📊 pos_weight per motor:", pos_weights)
 
     bce_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-    λ_exact = 0.3   # 보조 loss 가중치
+    λ_exact = 0.30 * (8.0 / M)        # 링크/모터 수에 맞춰 스케일(M=16이면 0.15)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
