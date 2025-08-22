@@ -245,13 +245,18 @@ if __name__ == "__main__":
     batch_size  = 16
     lr, wd      = 1e-3, 1e-4
     seed        = 42
-    device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     print("📥 device:", device)
 
     torch.manual_seed(seed); np.random.seed(seed)
 
     # ─── Load dataset ───────────────────────────────────
-    data    = np.load(data_path)
+    data    = np.load(data_path, allow_pickle=True)
     desired = data["desired"]
     actual  = data["actual"]
     labels  = data["label"]
