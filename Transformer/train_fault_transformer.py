@@ -110,7 +110,7 @@ class FaultDiagnosisTransformer(nn.Module):
         num_layers: int = 2,
         dim_feedforward: int = 128,
         dropout: float = 0.1,
-        output_dim: int = 16,      ##여기 고침.
+        output_dim: int = 8,     
         max_seq_len: int = 1000,
         rope_base: float = 10000.0,
     ):
