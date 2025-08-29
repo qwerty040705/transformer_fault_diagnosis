@@ -45,10 +45,10 @@ SAT_WARN_RATIO = 0.10
 THRUST_BOUND_SCALE = 100.0
 
 # 조인트 궤적 생성 파라미터
-VEL_MAX = 1.0          # rad/s (조인트 속도 상한)
-ACC_MAX = 6.0          # rad/s^2 (조인트 가속도 상한)
-VEL_NOISE_STD = 2.0    # 가속도 노이즈 표준편차 스케일(작을수록 더 부드러움)
-VEL_DECAY = 0.9        # 속도 저역통과(1.0이면 유지, 0.0이면 즉시 감쇠)
+VEL_MAX = 100              # rad/s (조인트 속도 상한)
+ACC_MAX = 600              # rad/s^2 (조인트 가속도 상한)
+VEL_NOISE_STD = 2.0        # 가속도 노이즈 표준편차 스케일(작을수록 더 부드러움)
+VEL_DECAY = 0.95           # 속도 저역통과(1.0이면 유지, 0.0이면 즉시 감쇠)
 
 TRAJ_MIN_POS_DELTA = 0.0   # (미사용) SE3 직접 샘플링 제거
 TRAJ_MIN_ROT_DELTA = 0.0   # (미사용)
