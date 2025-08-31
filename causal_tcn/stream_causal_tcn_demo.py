@@ -1,5 +1,5 @@
 # stream_causal_tcn_demo.py
-import os, time, argparse, csv, random
+import os, time, argparse, csv, random, warnings
 import numpy as np
 import torch
 import torch.nn as nn
@@ -55,22 +55,20 @@ class FaultDiagnosisTCN(nn.Module):
         return y.transpose(1,2)     # -> [B,T,M]
 
 def receptive_field(layers:int, k:int) -> int:
-    # R ≈ 1 + (k-1)*(2^layers - 1)  (dilations: 1,2,4,...)
     return 1 + (k-1)*(2**layers - 1)
 
-# ====================== (B) 스트리머: 한 프레임씩 추론 ======================
+# ====================== (B) 스트리머 ======================
 from collections import deque
 
 class KofN:
-    """ 최근 N프레임 중 K프레임 이상 양성일 때만 True (오경보 억제) """
+    """최근 N프레임 중 K프레임 이상 양성일 때만 True"""
     def __init__(self, M:int, K:int=3, N:int=5):
         self.K, self.N, self.M = K, N, M
-        self.buf = deque(maxlen=N)  # 각 step에서 (M,) bool
-    def step(self, pred_bool_m):    # pred_bool_m: (M,) bool/uint8
+        self.buf = deque(maxlen=N)
+    def step(self, pred_bool_m):
         self.buf.append(pred_bool_m.astype(np.uint8))
-        arr = np.stack(self.buf, axis=0)          # [n,M]
-        vote = (arr.sum(axis=0) >= self.K)        # [M]
-        return vote
+        arr = np.stack(self.buf, axis=0)
+        return (arr.sum(axis=0) >= self.K)
 
 class Streamer:
     def __init__(self, model, mu, std, device, lookback=None, threshold=0.5, kofn=None):
@@ -79,40 +77,30 @@ class Streamer:
         self.mu = torch.as_tensor(mu, dtype=torch.float32, device=device)
         self.std= torch.as_tensor(std, dtype=torch.float32, device=device)
         self.D = self.mu.numel()
-        self.M = model.head[-1].out_channels  # last conv out ch
+        self.M = model.head[-1].out_channels
         self.threshold = threshold
         self.lookback = lookback
-        self.buf = deque()  # 최신 X 프레임(raw, torch (D,)) 보관
+        self.buf = deque()
         self.kofn = kofn
 
     def step(self, x_t_np: np.ndarray):
-        """ x_t_np: (D,) numpy vector (raw feature at time t) """
         assert x_t_np.shape[-1] == self.D, f"expected D={self.D}, got {x_t_np.shape}"
         x_t = torch.from_numpy(x_t_np.astype(np.float32)).to(self.device)
         self.buf.append(x_t)
         if (self.lookback is not None) and (len(self.buf) > self.lookback):
             self.buf.popleft()
-
-        # make window tensor [1,L,D]
-        x_list = list(self.buf)
-        X = torch.stack(x_list, dim=0)                        # [L,D]
-        Xn = (X - self.mu) / self.std
-        Xn = Xn.unsqueeze(0)                                  # [1,L,D]
-
+        X = torch.stack(list(self.buf), dim=0)      # [L,D]
+        Xn = ((X - self.mu) / self.std).unsqueeze(0)  # [1,L,D]
         with torch.no_grad():
-            logits = self.model(Xn)                           # [1,L,M]
-            prob = torch.sigmoid(logits[0, -1])               # [M] only current frame
-        pred = (prob >= self.threshold).detach().cpu().numpy().astype(np.uint8)  # [M]
-        if self.kofn is not None:
-            pred_k = self.kofn.step(pred)
-        else:
-            pred_k = pred
-        return prob.detach().cpu().numpy(), pred, pred_k, len(self.buf)  # probs, raw, K-of-N, Lwin
+            logits = self.model(Xn)                 # [1,L,M]
+            prob = torch.sigmoid(logits[0, -1])     # [M]
+        pred = (prob >= self.threshold).detach().cpu().numpy().astype(np.uint8)
+        pred_k = self.kofn.step(pred) if self.kofn is not None else pred
+        return prob.detach().cpu().numpy(), pred, pred_k, len(self.buf)
 
-# ====================== (C) 데이터 로딩 (임의/NPY/CSV/NPZ) ======================
+# ====================== (C) 데이터 로딩 ======================
 def load_series_from_npy(npy_path:str):
-    X = np.load(npy_path)
-    assert X.ndim == 2, "Expected shape [T,D]"
+    X = np.load(npy_path); assert X.ndim == 2
     return X
 
 def load_series_from_csv(csv_path:str):
@@ -122,11 +110,9 @@ def load_series_from_csv(csv_path:str):
         for row in rdr:
             if not row: continue
             rows.append([float(x) for x in row])
-    X = np.array(rows, dtype=np.float32)
-    assert X.ndim == 2, "Expected shape [T,D]"
+    X = np.array(rows, dtype=np.float32); assert X.ndim == 2
     return X
 
-# ── 피처 빌더 (LEGACY/REL-only 대응) ──
 def _vee_skew(A):
     return np.stack([A[...,2,1]-A[...,1,2],
                      A[...,0,2]-A[...,2,0],
@@ -156,6 +142,7 @@ def _time_diff(x):
     return d
 def _flatten_3x4(T):
     return T[..., :3, :4].reshape(*T.shape[:-2], 12)
+
 def build_features_rel_only(d_rel, a_rel):
     S, T, L = d_rel.shape[:3]
     des_12 = _flatten_3x4(d_rel)
@@ -174,6 +161,7 @@ def build_features_rel_only(d_rel, a_rel):
     feats = np.concatenate([des_12, act_12, p_err, r_err, dp_des, dp_act, dr_des, dr_act], axis=-1)
     S_, T_, L_, _ = feats.shape
     return feats.reshape(S_, T_, L_*42).astype(np.float32)
+
 def build_features_legacy(desired, actual):
     S, T = desired.shape[:2]
     des_12 = desired[:, :, :3, :4].reshape(S, T, 12)
@@ -189,128 +177,295 @@ def build_features_legacy(desired, actual):
     dr_des = _rel_log_increment(R_des); dr_act = _rel_log_increment(R_act)
     X = np.concatenate([des_12, act_12, p_err, r_err, dp_des, dp_act, dr_des, dr_act], axis=2).astype(np.float32)
     return X
-def load_series_from_npz(npz_path:str, seq_idx:int=0):
+
+def load_all_from_npz(npz_path:str):
     d = np.load(npz_path, allow_pickle=True)
     keys = set(d.files)
     if {"desired_link_rel","actual_link_rel","desired_link_cum","actual_link_cum","label"}.issubset(keys):
         d_rel = d["desired_link_rel"]; a_rel = d["actual_link_rel"]
         labels = d["label"]
-        X = build_features_rel_only(d_rel, a_rel)  # (S,T,D)
-        Y = (1.0 - labels).astype(np.float32)      # (S,T,M) 1=fault
+        X = build_features_rel_only(d_rel, a_rel)
+        Y = (1.0 - labels).astype(np.float32)
     elif {"desired","actual","label"}.issubset(keys):
         desired = d["desired"]; actual = d["actual"]; labels = d["label"]
-        X = build_features_legacy(desired, actual) # (S,T,D)
+        X = build_features_legacy(desired, actual)
         Y = (1.0 - labels).astype(np.float32)
     else:
         raise KeyError(f"Unsupported .npz schema. keys={sorted(keys)}")
-    S = X.shape[0]; assert 0 <= seq_idx < S
-    return X[seq_idx], Y[seq_idx]  # (T,D), (T,M)
+    return X, Y
 
-# ====================== (D) 메인: 실시간 데모 루프 ======================
+def load_series_from_npz(npz_path:str, seq_idx:int=0):
+    X, Y = load_all_from_npz(npz_path)
+    S = X.shape[0]; assert 0 <= seq_idx < S
+    return X[seq_idx], Y[seq_idx]
+
+# ====================== (D) 메트릭 & ETA 유틸 ======================
+def segments_from_binary(b):
+    T = len(b); segs = []; in_run=False; s=0
+    for t in range(T):
+        if b[t] and not in_run: in_run=True; s=t
+        elif (not b[t]) and in_run: in_run=False; segs.append((s,t))
+    if in_run: segs.append((s,T))
+    return segs
+
+def pr_auc_average_precision(scores, labels):
+    scores = np.asarray(scores, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int32)
+    order = np.argsort(-scores)
+    labels_sorted = labels[order]
+    tp = labels_sorted.cumsum()
+    fp = np.cumsum(1 - labels_sorted)
+    prec = tp / np.maximum(tp + fp, 1)
+    total_pos = max(labels.sum(), 1)
+    ap = (prec * labels_sorted).sum() / total_pos
+    return ap
+
+def safe_div(a, b): return (a / b) if b > 0 else 0.0
+
+def _fmt_time(sec: float) -> str:
+    sec = max(0.0, float(sec))
+    m, s = divmod(int(sec + 0.5), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def eval_sequence(model, mu, std, device, X, Y, threshold=0.5, kofn=None, lookback=None, dt_ms=10,
+                  print_stream=False, show_eta=False, print_every=10, seq_name=None):
+    streamer = Streamer(model, mu, std, device, lookback=lookback, threshold=threshold, kofn=kofn)
+    T, D = X.shape; M = Y.shape[1]
+    hit_exact = 0
+    y_true_any = []; y_pred_any = []; score_any = []
+    t0 = time.time()
+    for t in range(T):
+        probs, pred_raw, pred_k, Lwin = streamer.step(X[t])
+        gt = Y[t].astype(np.uint8)
+        exact_k = int((pred_k == gt).all()); hit_exact += exact_k
+        any_true = int(gt.any()); any_pred = int(pred_k.any())
+        y_true_any.append(any_true); y_pred_any.append(any_pred)
+        score_any.append(float(probs.max()))
+        want_line = print_stream
+        want_eta  = show_eta and ((t+1) % max(1, print_every) == 0 or (t+1)==T)
+        if want_line:
+            n_pos_raw = int(pred_raw.sum()); n_pos_k = int(pred_k.sum())
+            line = f"[t={t:04d} | Lwin={Lwin:3d}] pos_raw={n_pos_raw:3d} pos_k={n_pos_k:3d} | exact_k={exact_k}"
+            if want_eta:
+                elapsed = time.time() - t0; done = t + 1
+                fps = done / max(elapsed, 1e-9); eta = (T - done) / max(fps, 1e-9); p = 100.0 * done / T
+                tag = f" | {seq_name}" if seq_name else ""
+                line += f"{tag} | {p:5.1f}% | elapsed={_fmt_time(elapsed)} | ETA={_fmt_time(eta)} | FPS={fps:.1f}"
+            print(line)
+        elif want_eta:
+            elapsed = time.time() - t0; done = t + 1
+            fps = done / max(elapsed, 1e-9); eta = (T - done) / max(fps, 1e-9); p = 100.0 * done / T
+            tag = f"[{seq_name}] " if seq_name else ""
+            print(f"{tag}progress {p:5.1f}% | elapsed={_fmt_time(elapsed)} | ETA={_fmt_time(eta)} | FPS={fps:.1f}")
+    y_true_any = np.array(y_true_any, dtype=np.uint8)
+    y_pred_any = np.array(y_pred_any, dtype=np.uint8)
+    score_any  = np.array(score_any, dtype=np.float32)
+    exact_all = hit_exact / T
+    tp = int(((y_true_any == 1) & (y_pred_any == 1)).sum())
+    fp = int(((y_true_any == 0) & (y_pred_any == 1)).sum())
+    fn = int(((y_true_any == 1) & (y_pred_any == 0)).sum())
+    prec = safe_div(tp, tp + fp); rec  = safe_div(tp, tp + fn)
+    f1   = safe_div(2*prec*rec, prec+rec) if (prec+rec)>0 else 0.0
+    auprc = pr_auc_average_precision(score_any, y_true_any)
+    gt_segs = segments_from_binary(y_true_any); pr_segs = segments_from_binary(y_pred_any)
+    tp_e=fp_e=fn_e=0; latencies_ms=[]; pr_used=set()
+    for (gs, ge) in gt_segs:
+        det_idx=None
+        for t in range(gs, ge):
+            if y_pred_any[t]==1: det_idx=t; break
+        if det_idx is not None:
+            tp_e += 1; latencies_ms.append((det_idx-gs)*dt_ms)
+            for i,(ps,pe) in enumerate(pr_segs):
+                if ps<=det_idx<pe: pr_used.add(i); break
+        else:
+            fn_e += 1
+    for i in range(len(pr_segs)):
+        if i not in pr_used: fp_e += 1
+    ev_prec = safe_div(tp_e, tp_e + fp_e); ev_rec = safe_div(tp_e, tp_e + fn_e)
+    lat_mean = float(np.mean(latencies_ms)) if len(latencies_ms)>0 else 0.0
+    lat_std  = float(np.std(latencies_ms))  if len(latencies_ms)>0 else 0.0
+    return {
+        "frame_exact_all": float(exact_all),
+        "frame_any_f1": float(f1),
+        "frame_auprc": float(auprc),
+        "event_recall": float(ev_rec),
+        "event_precision": float(ev_prec),
+        "event_latency_mean_ms": lat_mean,
+        "event_latency_std_ms": lat_std,
+        "n_events": len(gt_segs),
+        "n_pred_events": len(pr_segs),
+    }
+
+# ====================== (E) 메인 ======================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", type=str, required=True, help="학습 저장파일(.pth)")
+    ap.add_argument("--ckpt", type=str, required=True)
     ap.add_argument("--mode", choices=["rand","npy","csv","npz"], default="rand")
-    ap.add_argument("--path", type=str, help="mode가 npy/csv/npz일 때 파일 경로")
-    ap.add_argument("--seq_idx", type=int, default=0, help="npz에서 사용할 시퀀스 인덱스")
-    ap.add_argument("--T", type=int, default=1000, help="rand 모드 길이")
-    ap.add_argument("--sleep_ms", type=int, default=0, help="각 프레임 사이 대기(ms) (실시간 흉내)")
+    ap.add_argument("--path", type=str)
+    ap.add_argument("--seq_idx", type=int, default=0, help="-1=전체, 0~S-1=단일")
+    ap.add_argument("--T", type=int, default=1000)
+    ap.add_argument("--sleep_ms", type=int, default=0)
     ap.add_argument("--threshold", type=float, default=0.5)
-    ap.add_argument("--kofn", type=str, default="0,0", help="K,N (예: 3,5). 0,0이면 미사용")
-    ap.add_argument("--override_lookback", type=int, default=0, help="0이면 자동(R), 아니면 수동")
+    ap.add_argument("--kofn", type=str, default="0,0")  # "K,N"
+    ap.add_argument("--override_lookback", type=int, default=0)
     ap.add_argument("--print_every", type=int, default=10)
-    ap.add_argument("--seed", type=int, default=42, help="재현성 보장을 위한 난수 시드")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--dt_ms", type=float, default=10.0)
+    ap.add_argument("--quiet_stream", action="store_true")
+    ap.add_argument("--show_eta", action="store_true")
+    ap.add_argument("--sample_n", type=int, default=0, help="전체(-1) 모드에서 샘플 개수(중복 없이)")
     args = ap.parse_args()
 
-    # ── 시드 고정 ──
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
+    # 시드
+    np.random.seed(args.seed); torch.manual_seed(args.seed); random.seed(args.seed)
     if torch.cuda.is_available():
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic=True; torch.backends.cudnn.benchmark=False
 
-    # ── 장치 선택 ──
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    # 장치
+    if torch.cuda.is_available(): device=torch.device("cuda")
+    elif hasattr(torch.backends,"mps") and torch.backends.mps.is_available(): device=torch.device("mps")
+    else: device=torch.device("cpu")
     print("📥 device:", device)
 
-    # ── 체크포인트 로드 ──
-    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+    # 체크포인트 로드 (weights_only 안전 로드 → 실패 시 fallback)
+    import torch.serialization as ts
+    try:
+        ckpt = torch.load(args.ckpt, map_location=device, weights_only=True)
+    except Exception:
+        try:
+            if hasattr(ts, "add_safe_globals"):
+                import numpy as _np
+                ts.add_safe_globals([_np._core.multiarray._reconstruct])
+        except Exception:
+            pass
+        ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+
     D = int(ckpt["input_dim"]); M = int(ckpt["M"])
-    cfg = ckpt["cfg"]
-    hidden = int(cfg.get("hidden", 128))
-    layers = int(cfg.get("layers", 6))
-    ksize  = int(cfg.get("k", 3))
-    dropout= float(cfg.get("dropout", 0.1))
-
-    model = FaultDiagnosisTCN(input_dim=D, output_dim=M, hidden=hidden, layers=layers, k=ksize, dropout=dropout).to(device)
-    model.load_state_dict(ckpt["model_state"], strict=True)
-    model.eval()
-
+    cfg = ckpt["cfg"]; hidden=int(cfg.get("hidden",128))
+    layers=int(cfg.get("layers",6)); ksize=int(cfg.get("k",3)); dropout=float(cfg.get("dropout",0.1))
+    model = FaultDiagnosisTCN(D, M, hidden=hidden, layers=layers, k=ksize, dropout=dropout).to(device)
+    model.load_state_dict(ckpt["model_state"], strict=True); model.eval()
     mu = ckpt["train_mean"]; std = ckpt["train_std"]
     R_auto = receptive_field(layers, ksize)
-    lookback = args.override_lookback if args.override_lookback > 0 else R_auto
+    lookback = args.override_lookback if args.override_lookback>0 else R_auto
     print(f"🧮 receptive_field R≈{R_auto} | use lookback={lookback} | threshold={args.threshold}")
 
-    # ── 데이터 준비 ──
-    if args.mode == "rand":
-        T = args.T
-        X = np.random.randn(T, D).astype(np.float32) * 1.0
-        Y = None
-    elif args.mode == "npy":
-        X = load_series_from_npy(args.path)
-        assert X.shape[1] == D, f"npy feature dim {X.shape[1]} != ckpt D {D}"
-        Y = None
-    elif args.mode == "csv":
-        X = load_series_from_csv(args.path)
-        assert X.shape[1] == D, f"csv feature dim {X.shape[1]} != ckpt D {D}"
-        Y = None
-    elif args.mode == "npz":
-        X, Y = load_series_from_npz(args.path, seq_idx=args.seq_idx)
-        assert X.shape[1] == D, f"npz feature dim {X.shape[1]} != ckpt D {D}"
-        if Y.shape[1] != M:
-            raise ValueError(f"npz label dim {Y.shape[1]} != ckpt M {M}")
-        print(f"🎯 using NPZ sequence idx={args.seq_idx} | T={X.shape[0]}")
-
-    # ── 스트리머 구성 ──
+    # K-of-N
     if args.kofn != "0,0":
-        K,N = map(int, args.kofn.split(","))
-        kofn = KofN(M=M, K=K, N=N)
+        K,N = map(int, args.kofn.split(",")); kofn = KofN(M=M, K=K, N=N)
         print(f"🛡️  K-of-N smoothing: K={K}, N={N}")
     else:
         kofn = None
 
-    streamer = Streamer(model, mu, std, device, lookback=lookback, threshold=args.threshold, kofn=kofn)
+    # 데이터 & 실행
+    if args.mode == "rand":
+        T = args.T
+        X = np.random.randn(T, D).astype(np.float32)
+        Y = np.zeros((T, M), dtype=np.float32)
+        res = eval_sequence(model, mu, std, device, X, Y, args.threshold, kofn, lookback,
+                            dt_ms=args.dt_ms, print_stream=not args.quiet_stream,
+                            show_eta=args.show_eta, print_every=args.print_every, seq_name="rand")
+        print("\n================ STREAM METRICS ================")
+        print(f"Frame  - Exact-All: {res['frame_exact_all']:.4f} | AnyFault-F1: {res['frame_any_f1']:.4f} | AUPRC: {res['frame_auprc']:.4f}")
+        print(f"Event  - Recall: {res['event_recall']:.4f} | Precision: {res['event_precision']:.4f} | Latency: {res['event_latency_mean_ms']:.1f}±{res['event_latency_std_ms']:.1f} ms")
+        print("Note   - Metrics computed with K-of-N predictions.")
+        print("===============================================\n")
+        return
 
-    # ── 실시간 루프 ──
-    T = X.shape[0]; sleep_s = args.sleep_ms/1000.0
-    hit_exact = 0
-    for t in range(T):
-        probs, pred_raw, pred_k, Lwin = streamer.step(X[t])
+    elif args.mode in ["npy","csv"]:
+        X = load_series_from_npy(args.path) if args.mode=="npy" else load_series_from_csv(args.path)
+        assert X.shape[1] == D
+        _ = eval_sequence(model, mu, std, device, X, np.zeros((X.shape[0], M), dtype=np.float32),
+                          args.threshold, kofn, lookback, dt_ms=args.dt_ms,
+                          print_stream=not args.quiet_stream, show_eta=args.show_eta,
+                          print_every=args.print_every, seq_name=os.path.basename(args.path))
+        return
 
-        # 현재 프레임의 고장 예측 개수
-        n_pos_raw = int(pred_raw.sum())
-        n_pos_k   = int(pred_k.sum())
-        line = f"[t={t:04d} | Lwin={Lwin:3d}] pos_raw={n_pos_raw:3d} pos_k={n_pos_k:3d}"
+    elif args.mode == "npz":
+        if args.seq_idx == -1:
+            Xall, Yall = load_all_from_npz(args.path)
+            assert Xall.shape[2] == D and Yall.shape[2] == M
+            S = Xall.shape[0]
 
-        # 레이블 있으면 Exact-All 일치도 출력
-        if Y is not None:
-            gt = Y[t].astype(np.uint8)
-            exact_raw = int((pred_raw == gt).all())
-            exact_k   = int((pred_k   == gt).all())
-            line += f" | exact_raw={exact_raw} exact_k={exact_k}"
-            hit_exact += exact_k
+            # === 샘플 평가 ===
+            if args.sample_n > 0:
+                n = min(args.sample_n, S)
+                rng = np.random.RandomState(args.seed)  # 시드 42로 고정 가능
+                idxs = rng.choice(S, size=n, replace=False)
+                print(f"🎯 NPZ 샘플 평가: S={S} 중 {n}개 샘플 (seed={args.seed})")
+            else:
+                idxs = np.arange(S)
+                print(f"🎯 NPZ 전체 평가: S={S} sequences")
 
-        print(line)
-        if sleep_s > 0: time.sleep(sleep_s)
+            accs=[]; f1s=[]; aups=[]; er=[]; ep=[]; lats=[]; latstd=[]; nevs=[]; npreds=[]
+            t0 = time.time()
+            for i, s in enumerate(idxs):
+                name = f"seq{s:03d}"
+                res = eval_sequence(model, mu, std, device, Xall[s], Yall[s],
+                                    args.threshold, kofn, lookback, dt_ms=args.dt_ms,
+                                    print_stream=False, show_eta=False,
+                                    print_every=args.print_every, seq_name=name)
+                accs.append(res["frame_exact_all"]); f1s.append(res["frame_any_f1"]); aups.append(res["frame_auprc"])
+                er.append(res["event_recall"]); ep.append(res["event_precision"])
+                lats.append(res["event_latency_mean_ms"]); latstd.append(res["event_latency_std_ms"])
+                nevs.append(res["n_events"]); npreds.append(res["n_pred_events"])
 
-    if Y is not None:
-        print(f"✅ stream Exact-All (K-of-N 기준) = {hit_exact / T:.4f}")
+                if args.show_eta:
+                    elapsed = time.time() - t0
+                    done = i + 1; total = len(idxs)
+                    seqps = done / max(elapsed, 1e-9); eta = (total - done) / max(seqps, 1e-9); p = 100.0 * done / total
+                    print(f"[dataset] {p:5.1f}% | elapsed={_fmt_time(elapsed)} | ETA={_fmt_time(eta)} | seq/s={seqps:.2f}")
+
+            def mean(x): return float(np.mean(x)) if len(x)>0 else 0.0
+            picked = f"(picked idx: {list(map(int, idxs))[:10]}{'...' if len(idxs)>10 else ''})" if args.sample_n>0 else ""
+            print("\n================ DATASET AVERAGE METRICS ================")
+            print(f"Frame  - Exact-All: {mean(accs):.4f} | AnyFault-F1: {mean(f1s):.4f} | AUPRC: {mean(aups):.4f}")
+            print(f"Event  - Recall: {mean(er):.4f} | Precision: {mean(ep):.4f} | Latency: {mean(lats):.1f}±{mean(latstd):.1f} ms")
+            print(f"Counts - #GT events/seq: {mean(nevs):.2f} | #Pred events/seq: {mean(npreds):.2f}")
+            if args.sample_n>0: print(f"Note   - {args.sample_n} sequences sampled {picked}")
+            print("Note   - Metrics computed with K-of-N predictions.")
+            print("=========================================================\n")
+            return
+        else:
+            X, Y = load_series_from_npz(args.path, seq_idx=args.seq_idx)
+            assert X.shape[1] == D and Y.shape[1] == M
+            print(f"🎯 using NPZ sequence idx={args.seq_idx} | T={X.shape[0]}")
+            res = eval_sequence(model, mu, std, device, X, Y, args.threshold, kofn, lookback,
+                                dt_ms=args.dt_ms, print_stream=not args.quiet_stream,
+                                show_eta=args.show_eta, print_every=args.print_every,
+                                seq_name=f"seq{args.seq_idx:03d}")
+            print("\n================ STREAM METRICS ================")
+            print(f"Frame  - Exact-All: {res['frame_exact_all']:.4f} | AnyFault-F1: {res['frame_any_f1']:.4f} | AUPRC: {res['frame_auprc']:.4f}")
+            print(f"Event  - Recall: {res['event_recall']:.4f} | Precision: {res['event_precision']:.4f} | Latency: {res['event_latency_mean_ms']:.1f}±{res['event_latency_std_ms']:.1f} ms")
+            print("Note   - Metrics computed with K-of-N predictions.")
+            print("===============================================\n")
+            return
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+"""
+python3 causal_tcn/stream_causal_tcn_demo.py \
+  --ckpt TCN/TCN_link_2_RELonly_CAUSAL.pth \
+  --mode npz --path data_storage/link_2/fault_dataset.npz \
+  --seq_idx -1 --kofn 3,5 --threshold 0.5 \
+  --show_eta --print_every 25
+  """
+
+
+"""
+python3 causal_tcn/stream_causal_tcn_demo.py \
+  --ckpt TCN/TCN_link_2_RELonly_CAUSAL.pth \
+  --mode npz --path data_storage/link_2/fault_dataset.npz \
+  --seq_idx -1 --sample_n 100 \
+  --kofn 3,5 --threshold 0.5 --dt_ms 10 \
+  --show_eta
+"""

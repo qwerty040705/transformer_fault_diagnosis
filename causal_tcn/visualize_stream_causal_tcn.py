@@ -9,7 +9,7 @@ from matplotlib.animation import FFMpegWriter, PillowWriter
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from mpl_toolkits.mplot3d import proj3d  # ← 3D→2D 투영(항상 수평 라벨용)
 
-from casual_tcn.stream_casual_tcn_demo import (
+from causal_tcn.stream_causal_tcn_demo import (
     FaultDiagnosisTCN, receptive_field, KofN, Streamer, load_series_from_npz
 )
 
@@ -552,10 +552,10 @@ if __name__ == "__main__":
 
 """
 디버깅용 터미널 입력
-python3 casual_tcn/visualize_stream_casual_tcn.py \
-  --ckpt TCN/TCN_link_2_RELonly_CAUSAL.pth \
-  --npz  data_storage/link_2/fault_dataset.npz \
-  --seq_idx 1000 \
+python3 causal_tcn/visualize_stream_causal_tcn.py \
+  --ckpt TCN/TCN_link_1_RELonly_CAUSAL.pth \
+  --npz  data_storage/link_1/fault_dataset.npz \
+  --seq_idx 100 \
   --threshold 0.5 \
   --kofn 3,5 \
   --data_hz 100 --speed 1.0 \
@@ -569,10 +569,10 @@ python3 casual_tcn/visualize_stream_casual_tcn.py \
 
 
 """ MP4저장
-python3 casual_tcn/visualize_stream_casual_tcn.py \
-  --ckpt TCN/TCN_link_2_RELonly_CAUSAL.pth \
-  --npz  data_storage/link_2/fault_dataset.npz \
-  --seq_idx 1000 \
+python3 causal_tcn/visualize_stream_causal_tcn.py \
+  --ckpt TCN/TCN_link_1_RELonly_CAUSAL.pth \
+  --npz  data_storage/link_1/fault_dataset.npz \
+  --seq_idx 100 \
   --threshold 0.5 --kofn 3,5 \
   --data_hz 100 --speed 3.33 \
   --prepend_base 1 --fix_origin 1 \
@@ -582,7 +582,6 @@ python3 casual_tcn/visualize_stream_casual_tcn.py \
   --arm_len 0.15 \
   --prop_blades 4 --prop_radius 0.08 --prop_chord 0.028 --prop_alpha 0.85 \
   --save_video 1 \
-  --out data_storage/link_2/vis.mp4 \
+  --out data_storage/link_1/vis.mp4 \
   --video_fps 30 --codec libx264 --bitrate 6000k --dpi 150
-
 """
