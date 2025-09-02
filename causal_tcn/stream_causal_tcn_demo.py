@@ -1,10 +1,12 @@
 # stream_causal_tcn_demo.py
-import os, time, argparse, csv, random, warnings
+
+import os, time, argparse, csv, random, warnings, sys
 import numpy as np
 import torch
 import torch.nn as nn
+from collections import deque
 
-# ====================== (A) TCN 모델 정의 (학습과 동일) ======================
+# ====================== (A) TCN 모델 정의 ======================
 class CausalConv1d(nn.Conv1d):
     def __init__(self, in_ch, out_ch, kernel_size, dilation=1):
         padding = (kernel_size - 1) * dilation
@@ -58,17 +60,15 @@ def receptive_field(layers:int, k:int) -> int:
     return 1 + (k-1)*(2**layers - 1)
 
 # ====================== (B) 스트리머 ======================
-from collections import deque
-
 class KofN:
-    """최근 N프레임 중 K프레임 이상 양성일 때만 True"""
+    """최근 N프레임 중 K프레임 이상 양성일 때만 True (모터별 벡터에 적용)"""
     def __init__(self, M:int, K:int=3, N:int=5):
         self.K, self.N, self.M = K, N, M
         self.buf = deque(maxlen=N)
-    def step(self, pred_bool_m):
+    def step(self, pred_bool_m: np.ndarray):
         self.buf.append(pred_bool_m.astype(np.uint8))
-        arr = np.stack(self.buf, axis=0)
-        return (arr.sum(axis=0) >= self.K)
+        arr = np.stack(self.buf, axis=0)         # [N, M]
+        return (arr.sum(axis=0) >= self.K)       # [M]
 
 class Streamer:
     def __init__(self, model, mu, std, device, lookback=None, threshold=0.5, kofn=None):
@@ -89,14 +89,15 @@ class Streamer:
         self.buf.append(x_t)
         if (self.lookback is not None) and (len(self.buf) > self.lookback):
             self.buf.popleft()
-        X = torch.stack(list(self.buf), dim=0)      # [L,D]
+        X = torch.stack(list(self.buf), dim=0)        # [L,D]
         Xn = ((X - self.mu) / self.std).unsqueeze(0)  # [1,L,D]
         with torch.no_grad():
-            logits = self.model(Xn)                 # [1,L,M]
-            prob = torch.sigmoid(logits[0, -1])     # [M]
-        pred = (prob >= self.threshold).detach().cpu().numpy().astype(np.uint8)
-        pred_k = self.kofn.step(pred) if self.kofn is not None else pred
-        return prob.detach().cpu().numpy(), pred, pred_k, len(self.buf)
+            logits = self.model(Xn)                   # [1,L,M]
+            logit_t = logits[0, -1]                   # [M]
+            prob_t = torch.sigmoid(logit_t)           # [M]
+        pred_raw = (prob_t >= self.threshold).to(torch.uint8).cpu().numpy()  # [M]
+        pred_k   = self.kofn.step(pred_raw) if self.kofn is not None else pred_raw
+        return logit_t.cpu().numpy(), prob_t.cpu().numpy(), pred_raw, pred_k, len(self.buf)
 
 # ====================== (C) 데이터 로딩 ======================
 def load_series_from_npy(npy_path:str):
@@ -230,50 +231,73 @@ def _fmt_time(sec: float) -> str:
 
 def eval_sequence(model, mu, std, device, X, Y, threshold=0.5, kofn=None, lookback=None, dt_ms=10,
                   print_stream=False, show_eta=False, print_every=10, seq_name=None):
+    """
+    Exact-All 기반 평가:
+      - Frame positive (GT): any fault (=1) 존재 프레임
+      - Frame positive (Pred): 예측 벡터가 GT와 완벽히 일치(Exact-All)한 프레임
+    """
     streamer = Streamer(model, mu, std, device, lookback=lookback, threshold=threshold, kofn=kofn)
     T, D = X.shape; M = Y.shape[1]
+
     hit_exact = 0
-    y_true_any = []; y_pred_any = []; score_any = []
+    exact_flags = []          # Pred exact-all 여부 (0/1)
+    gt_fault_flags = []       # GT any-fault 여부 (0/1)
+    exact_conf_scores = []    # Exact-All confidence score = min_m q_m
     t0 = time.time()
+
     for t in range(T):
-        probs, pred_raw, pred_k, Lwin = streamer.step(X[t])
-        gt = Y[t].astype(np.uint8)
-        exact_k = int((pred_k == gt).all()); hit_exact += exact_k
-        any_true = int(gt.any()); any_pred = int(pred_k.any())
-        y_true_any.append(any_true); y_pred_any.append(any_pred)
-        score_any.append(float(probs.max()))
-        want_line = print_stream
-        want_eta  = show_eta and ((t+1) % max(1, print_every) == 0 or (t+1)==T)
-        if want_line:
-            n_pos_raw = int(pred_raw.sum()); n_pos_k = int(pred_k.sum())
+        logits_t, probs_t, pred_raw, pred_k, Lwin = streamer.step(X[t])  # probs/logits: [M] (numpy)
+        gt_vec = Y[t].astype(np.uint8)                                    # [M]
+
+        exact_k = int((pred_k == gt_vec).all())
+        hit_exact += exact_k
+        exact_flags.append(exact_k)
+
+        gt_fault = int(gt_vec.any())
+        gt_fault_flags.append(gt_fault)
+
+        q = np.where(gt_vec == 1, probs_t, 1.0 - probs_t)  # [M]
+        exact_conf_scores.append(float(q.min()))
+
+        if print_stream:
+            n_pos_raw = int((probs_t >= threshold).sum())
+            n_pos_k = int(np.array(pred_k).sum())
             line = f"[t={t:04d} | Lwin={Lwin:3d}] pos_raw={n_pos_raw:3d} pos_k={n_pos_k:3d} | exact_k={exact_k}"
-            if want_eta:
+            if show_eta and ((t+1) % max(1, print_every) == 0 or (t+1)==T):
                 elapsed = time.time() - t0; done = t + 1
                 fps = done / max(elapsed, 1e-9); eta = (T - done) / max(fps, 1e-9); p = 100.0 * done / T
                 tag = f" | {seq_name}" if seq_name else ""
                 line += f"{tag} | {p:5.1f}% | elapsed={_fmt_time(elapsed)} | ETA={_fmt_time(eta)} | FPS={fps:.1f}"
-            print(line)
-        elif want_eta:
+            print(line, flush=True)
+        elif show_eta and ((t+1) % max(1, print_every) == 0 or (t+1)==T):
             elapsed = time.time() - t0; done = t + 1
             fps = done / max(elapsed, 1e-9); eta = (T - done) / max(fps, 1e-9); p = 100.0 * done / T
             tag = f"[{seq_name}] " if seq_name else ""
-            print(f"{tag}progress {p:5.1f}% | elapsed={_fmt_time(elapsed)} | ETA={_fmt_time(eta)} | FPS={fps:.1f}")
-    y_true_any = np.array(y_true_any, dtype=np.uint8)
-    y_pred_any = np.array(y_pred_any, dtype=np.uint8)
-    score_any  = np.array(score_any, dtype=np.float32)
-    exact_all = hit_exact / T
-    tp = int(((y_true_any == 1) & (y_pred_any == 1)).sum())
-    fp = int(((y_true_any == 0) & (y_pred_any == 1)).sum())
-    fn = int(((y_true_any == 1) & (y_pred_any == 0)).sum())
-    prec = safe_div(tp, tp + fp); rec  = safe_div(tp, tp + fn)
-    f1   = safe_div(2*prec*rec, prec+rec) if (prec+rec)>0 else 0.0
-    auprc = pr_auc_average_precision(score_any, y_true_any)
-    gt_segs = segments_from_binary(y_true_any); pr_segs = segments_from_binary(y_pred_any)
+            print(f"{tag}progress {p:5.1f}% | elapsed={_fmt_time(elapsed)} | ETA={_fmt_time(eta)} | FPS={fps:.1f}", flush=True)
+
+    exact_flags = np.array(exact_flags, dtype=np.uint8)
+    gt_fault_flags = np.array(gt_fault_flags, dtype=np.uint8)
+    exact_conf_scores = np.array(exact_conf_scores, dtype=np.float32)
+
+    # Frame-level (Exact-All)
+    frame_exact_all_acc = float(hit_exact / T)
+    TP = int(((gt_fault_flags == 1) & (exact_flags == 1)).sum())
+    FP = int(((gt_fault_flags == 0) & (exact_flags == 1)).sum())
+    FN = int(((gt_fault_flags == 1) & (exact_flags == 0)).sum())
+    prec_exact = safe_div(TP, TP + FP)
+    rec_exact  = safe_div(TP, TP + FN)
+    f1_exact   = safe_div(2*prec_exact*rec_exact, prec_exact+rec_exact) if (prec_exact+rec_exact)>0 else 0.0
+    auprc_exact = pr_auc_average_precision(exact_conf_scores, gt_fault_flags)
+
+    # Event-level (Exact-All)
+    gt_segs = segments_from_binary(gt_fault_flags.tolist())
+    pr_segs = segments_from_binary(exact_flags.tolist())
+
     tp_e=fp_e=fn_e=0; latencies_ms=[]; pr_used=set()
     for (gs, ge) in gt_segs:
         det_idx=None
         for t in range(gs, ge):
-            if y_pred_any[t]==1: det_idx=t; break
+            if exact_flags[t]==1: det_idx=t; break
         if det_idx is not None:
             tp_e += 1; latencies_ms.append((det_idx-gs)*dt_ms)
             for i,(ps,pe) in enumerate(pr_segs):
@@ -282,19 +306,34 @@ def eval_sequence(model, mu, std, device, X, Y, threshold=0.5, kofn=None, lookba
             fn_e += 1
     for i in range(len(pr_segs)):
         if i not in pr_used: fp_e += 1
-    ev_prec = safe_div(tp_e, tp_e + fp_e); ev_rec = safe_div(tp_e, tp_e + fn_e)
+
+    ev_prec = safe_div(tp_e, tp_e + fp_e)
+    ev_rec  = safe_div(tp_e, tp_e + fn_e)
     lat_mean = float(np.mean(latencies_ms)) if len(latencies_ms)>0 else 0.0
     lat_std  = float(np.std(latencies_ms))  if len(latencies_ms)>0 else 0.0
+
+    if len(latencies_ms) > 0:
+        q1, q2, q3 = np.percentile(latencies_ms, [25, 50, 75])
+        lat_q1 = float(q1); lat_q2 = float(q2); lat_q3 = float(q3)
+    else:
+        lat_q1 = lat_q2 = lat_q3 = 0.0
+
     return {
-        "frame_exact_all": float(exact_all),
-        "frame_any_f1": float(f1),
-        "frame_auprc": float(auprc),
-        "event_recall": float(ev_rec),
-        "event_precision": float(ev_prec),
+        "frame_exact_all_acc": float(frame_exact_all_acc),
+        "frame_exactall_f1": float(f1_exact),
+        "frame_exactall_precision": float(prec_exact),
+        "frame_exactall_recall": float(rec_exact),
+        "frame_auprc_exactall": float(auprc_exact),
+        "event_recall_exactall": float(ev_rec),
+        "event_precision_exactall": float(ev_prec),
         "event_latency_mean_ms": lat_mean,
         "event_latency_std_ms": lat_std,
+        "latencies_ms": latencies_ms,      # 이벤트별 latency 리스트
         "n_events": len(gt_segs),
         "n_pred_events": len(pr_segs),
+        "latency_q1_ms": lat_q1,
+        "latency_q2_ms": lat_q2,           # median
+        "latency_q3_ms": lat_q3,
     }
 
 # ====================== (E) 메인 ======================
@@ -328,7 +367,7 @@ def main():
     else: device=torch.device("cpu")
     print("📥 device:", device)
 
-    # 체크포인트 로드 (weights_only 안전 로드 → 실패 시 fallback)
+    # 체크포인트 로드
     import torch.serialization as ts
     try:
         ckpt = torch.load(args.ckpt, map_location=device, weights_only=True)
@@ -351,7 +390,7 @@ def main():
     lookback = args.override_lookback if args.override_lookback>0 else R_auto
     print(f"🧮 receptive_field R≈{R_auto} | use lookback={lookback} | threshold={args.threshold}")
 
-    # K-of-N
+    # K-of-N (모터별 벡터 smoothing)
     if args.kofn != "0,0":
         K,N = map(int, args.kofn.split(",")); kofn = KofN(M=M, K=K, N=N)
         print(f"🛡️  K-of-N smoothing: K={K}, N={N}")
@@ -366,11 +405,13 @@ def main():
         res = eval_sequence(model, mu, std, device, X, Y, args.threshold, kofn, lookback,
                             dt_ms=args.dt_ms, print_stream=not args.quiet_stream,
                             show_eta=args.show_eta, print_every=args.print_every, seq_name="rand")
-        print("\n================ STREAM METRICS ================")
-        print(f"Frame  - Exact-All: {res['frame_exact_all']:.4f} | AnyFault-F1: {res['frame_any_f1']:.4f} | AUPRC: {res['frame_auprc']:.4f}")
-        print(f"Event  - Recall: {res['event_recall']:.4f} | Precision: {res['event_precision']:.4f} | Latency: {res['event_latency_mean_ms']:.1f}±{res['event_latency_std_ms']:.1f} ms")
-        print("Note   - Metrics computed with K-of-N predictions.")
-        print("===============================================\n")
+        print("\n================ STREAM METRICS (Exact-All) ================")
+        print(f"Frame  - Exact-All acc: {res['frame_exact_all_acc']:.4f} | F1: {res['frame_exactall_f1']:.4f} "
+              f"(P={res['frame_exactall_precision']:.3f}, R={res['frame_exactall_recall']:.3f}) | AUPRC: {res['frame_auprc_exactall']:.4f}")
+        print(f"Event  - Recall: {res['event_recall_exactall']:.4f} | Precision: {res['event_precision_exactall']:.4f} "
+              f"| Latency: {res['event_latency_mean_ms']:.1f}±{res['event_latency_std_ms']:.1f} ms")
+        print("Note   - All metrics computed under Exact-All definitions.")
+        print("============================================================\n")
         return
 
     elif args.mode in ["npy","csv"]:
@@ -388,17 +429,21 @@ def main():
             assert Xall.shape[2] == D and Yall.shape[2] == M
             S = Xall.shape[0]
 
-            # === 샘플 평가 ===
+            # 샘플 평가
             if args.sample_n > 0:
                 n = min(args.sample_n, S)
-                rng = np.random.RandomState(args.seed)  # 시드 42로 고정 가능
+                rng = np.random.RandomState(args.seed)
                 idxs = rng.choice(S, size=n, replace=False)
                 print(f"🎯 NPZ 샘플 평가: S={S} 중 {n}개 샘플 (seed={args.seed})")
             else:
                 idxs = np.arange(S)
                 print(f"🎯 NPZ 전체 평가: S={S} sequences")
 
-            accs=[]; f1s=[]; aups=[]; er=[]; ep=[]; lats=[]; latstd=[]; nevs=[]; npreds=[]
+            accs=[]; f1s=[]; pre=[]; rec=[]; aups=[]
+            er=[]; ep=[]
+            nevs=[]; npreds=[]
+            all_latencies=[]  # 데이터셋 전체 이벤트 latency
+
             t0 = time.time()
             for i, s in enumerate(idxs):
                 name = f"seq{s:03d}"
@@ -406,27 +451,47 @@ def main():
                                     args.threshold, kofn, lookback, dt_ms=args.dt_ms,
                                     print_stream=False, show_eta=False,
                                     print_every=args.print_every, seq_name=name)
-                accs.append(res["frame_exact_all"]); f1s.append(res["frame_any_f1"]); aups.append(res["frame_auprc"])
-                er.append(res["event_recall"]); ep.append(res["event_precision"])
-                lats.append(res["event_latency_mean_ms"]); latstd.append(res["event_latency_std_ms"])
+                accs.append(res["frame_exact_all_acc"])
+                f1s.append(res["frame_exactall_f1"])
+                pre.append(res["frame_exactall_precision"]); rec.append(res["frame_exactall_recall"])
+                aups.append(res["frame_auprc_exactall"])
+                er.append(res["event_recall_exactall"]); ep.append(res["event_precision_exactall"])
                 nevs.append(res["n_events"]); npreds.append(res["n_pred_events"])
+                all_latencies.extend(res["latencies_ms"])
 
                 if args.show_eta:
                     elapsed = time.time() - t0
                     done = i + 1; total = len(idxs)
-                    seqps = done / max(elapsed, 1e-9); eta = (total - done) / max(seqps, 1e-9); p = 100.0 * done / total
-                    print(f"[dataset] {p:5.1f}% | elapsed={_fmt_time(elapsed)} | ETA={_fmt_time(eta)} | seq/s={seqps:.2f}")
+                    seqps = done / max(elapsed, 1e-9)
+                    eta = (total - done) / max(seqps, 1e-9)
+                    p = 100.0 * done / total
+                    print(f"[dataset] {p:5.1f}% | elapsed={_fmt_time(elapsed)} | ETA={_fmt_time(eta)} | seq/s={seqps:.2f}", flush=True)
 
             def mean(x): return float(np.mean(x)) if len(x)>0 else 0.0
+
+            # 데이터셋 전체 이벤트 기준 latency 통계
+            if len(all_latencies) > 0:
+                ds_lat_mean = float(np.mean(all_latencies))
+                ds_lat_std  = float(np.std(all_latencies))
+                ds_q1, ds_q2, ds_q3 = np.percentile(all_latencies, [25, 50, 75])
+                ds_q1 = float(ds_q1); ds_q2 = float(ds_q2); ds_q3 = float(ds_q3)
+            else:
+                ds_lat_mean = ds_lat_std = 0.0
+                ds_q1 = ds_q2 = ds_q3 = 0.0
+
             picked = f"(picked idx: {list(map(int, idxs))[:10]}{'...' if len(idxs)>10 else ''})" if args.sample_n>0 else ""
-            print("\n================ DATASET AVERAGE METRICS ================")
-            print(f"Frame  - Exact-All: {mean(accs):.4f} | AnyFault-F1: {mean(f1s):.4f} | AUPRC: {mean(aups):.4f}")
-            print(f"Event  - Recall: {mean(er):.4f} | Precision: {mean(ep):.4f} | Latency: {mean(lats):.1f}±{mean(latstd):.1f} ms")
+            print("\n================ DATASET AVERAGE METRICS (Exact-All) ================")
+            print(f"Frame  - Exact-All acc: {mean(accs):.4f} | F1: {mean(f1s):.4f} "
+                  f"(P={mean(pre):.3f}, R={mean(rec):.3f}) | AUPRC: {mean(aups):.4f}")
+            print(f"Event  - Recall: {mean(er):.4f} | Precision: {mean(ep):.4f} "
+                  f"| Latency: {ds_lat_mean:.1f}±{ds_lat_std:.1f} ms "
+                  f"(Q1={ds_q1:.1f}, Q2={ds_q2:.1f}, Q3={ds_q3:.1f})")
             print(f"Counts - #GT events/seq: {mean(nevs):.2f} | #Pred events/seq: {mean(npreds):.2f}")
             if args.sample_n>0: print(f"Note   - {args.sample_n} sequences sampled {picked}")
-            print("Note   - Metrics computed with K-of-N predictions.")
-            print("=========================================================\n")
+            print("Note   - All metrics computed under Exact-All definitions.")
+            print("=====================================================================\n")
             return
+
         else:
             X, Y = load_series_from_npz(args.path, seq_idx=args.seq_idx)
             assert X.shape[1] == D and Y.shape[1] == M
@@ -435,16 +500,17 @@ def main():
                                 dt_ms=args.dt_ms, print_stream=not args.quiet_stream,
                                 show_eta=args.show_eta, print_every=args.print_every,
                                 seq_name=f"seq{args.seq_idx:03d}")
-            print("\n================ STREAM METRICS ================")
-            print(f"Frame  - Exact-All: {res['frame_exact_all']:.4f} | AnyFault-F1: {res['frame_any_f1']:.4f} | AUPRC: {res['frame_auprc']:.4f}")
-            print(f"Event  - Recall: {res['event_recall']:.4f} | Precision: {res['event_precision']:.4f} | Latency: {res['event_latency_mean_ms']:.1f}±{res['event_latency_std_ms']:.1f} ms")
-            print("Note   - Metrics computed with K-of-N predictions.")
-            print("===============================================\n")
+            print("\n================ STREAM METRICS (Exact-All) ================")
+            print(f"Frame  - Exact-All acc: {res['frame_exact_all_acc']:.4f} | F1: {res['frame_exactall_f1']:.4f} "
+                  f"(P={res['frame_exactall_precision']:.3f}, R={res['frame_exactall_recall']:.3f}) | AUPRC: {res['frame_auprc_exactall']:.4f}")
+            print(f"Event  - Recall: {res['event_recall_exactall']:.4f} | Precision: {res['event_precision_exactall']:.4f} "
+                  f"| Latency: {res['event_latency_mean_ms']:.1f}±{res['event_latency_std_ms']:.3f} ms")
+            print("Note   - All metrics computed under Exact-All definitions.")
+            print("============================================================\n")
             return
 
 if __name__ == "__main__":
     main()
-
 
 
 
@@ -461,7 +527,7 @@ python3 causal_tcn/stream_causal_tcn_demo.py \
   """
 
 
-"""
+"""일부
 python3 causal_tcn/stream_causal_tcn_demo.py \
   --ckpt TCN/TCN_link_2_RELonly_CAUSAL.pth \
   --mode npz --path data_storage/link_2/fault_dataset.npz \
