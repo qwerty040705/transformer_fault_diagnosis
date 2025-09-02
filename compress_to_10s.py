@@ -54,7 +54,7 @@ if __name__ == "__main__":
 
 """
 python3 compress_to_10s.py \
-  --input data_storage/link_2/vis.mp4 \
-  --output data_storage/link_2/vis_10s.mp4 \
+  --input data_storage/link_1/vis.mp4 \
+  --output data_storage/link_1/vis_10s.mp4 \
   --target_sec 10
 """
