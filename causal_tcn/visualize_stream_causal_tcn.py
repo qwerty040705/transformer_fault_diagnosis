@@ -387,7 +387,7 @@ def main():
             return []
 
         # 추론
-        probs, pred_raw, pred_k, Lwin = streamer.step(X[t])
+        logits, probs, pred_raw, pred_k, Lwin = streamer.step(X[t])
         prob_last[:M_out] = probs[:M_out]
         predk_last[:M_out] = pred_k[:M_out]
 
@@ -553,8 +553,8 @@ if __name__ == "__main__":
 """
 디버깅용 터미널 입력
 python3 causal_tcn/visualize_stream_causal_tcn.py \
-  --ckpt TCN/TCN_link_1_RELonly_CAUSAL.pth \
-  --npz  data_storage/link_1/fault_dataset.npz \
+  --ckpt TCN/TCN_link_3_RELonly_CAUSAL.pth \
+  --npz  data_storage/link_3/fault_dataset.npz \
   --seq_idx 100 \
   --threshold 0.5 \
   --kofn 3,5 \
