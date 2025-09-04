@@ -79,7 +79,7 @@ raw_times = [0, 1, 10, 50, 100, 150, 200, 250, 500, 750, 800, 999]
 time_idx_list = [t for t in raw_times if t < T]
 
 # ---------- Which sample to inspect ----------
-sample_idx = 8
+sample_idx = 0
 assert 0 <= sample_idx < S, "sample_idx out of range"
 
 # ---------- Inspection ----------

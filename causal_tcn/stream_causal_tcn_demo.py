@@ -529,9 +529,9 @@ python3 causal_tcn/stream_causal_tcn_demo.py \
 
 """일부
 python3 causal_tcn/stream_causal_tcn_demo.py \
-  --ckpt TCN/TCN_link_1_RELonly_CAUSAL.pth \
-  --mode npz --path data_storage/link_1/fault_dataset.npz \
+  --ckpt TCN/TCN_link_3_RELonly_CAUSAL.pth \
+  --mode npz --path data_storage/link_3/fault_dataset.npz \
   --seq_idx -1 --sample_n 100 \
-  --kofn 4,5 --threshold 0.5 --dt_ms 10 \
+  --kofn 3,5 --threshold 0.5 --dt_ms 10 \
   --show_eta
 """

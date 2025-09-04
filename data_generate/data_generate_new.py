@@ -48,7 +48,7 @@ SAT_WARN_RATIO = 0.10
 THRUST_BOUND_SCALE = 20.0  # (이전 100) actuator 상한 스케일다운
 
 # 조인트 궤적 생성 파라미터 (너무 세게 안 튀도록 유지)
-VEL_MAX = 0.5              # rad/s (생성기 속도 상한, 의도적으로 낮춤)
+VEL_MAX = 0.5             # rad/s (생성기 속도 상한, 의도적으로 낮춤)
 ACC_MAX = 5.0              # rad/s^2 (생성기 가속도 상한, 의도적으로 낮춤)
 VEL_NOISE_STD = 0.5
 VEL_DECAY = 0.95
@@ -381,7 +381,7 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
             inf_des = np.linalg.norm(dq_des[t], ord=np.inf)
             inf_raw = np.linalg.norm(actual_dq[t], ord=np.inf)  # 방금 업데이트 후
             inf_clip = np.linalg.norm(np.clip(actual_dq[t], -MAX_ABS_DQ, MAX_ABS_DQ), ord=np.inf)
-            """print(f"[t={t}] |dq_des|_inf={inf_des:.02f}, |dq_raw|_inf={inf_raw:.2f}, |dq_clip|_inf={inf_clip:.2f}")"""
+            print(f"[t={t}] |dq_des|_inf={inf_des:.02f}, |dq_raw|_inf={inf_raw:.2f}, |dq_clip|_inf={inf_clip:.2f}")
 
     return (
         desired_ee,
