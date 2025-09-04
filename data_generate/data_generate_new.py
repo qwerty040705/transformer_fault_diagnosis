@@ -456,7 +456,7 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
             inf_des = np.linalg.norm(dq_des[t], ord=np.inf)
             inf_raw = np.linalg.norm(actual_dq[t], ord=np.inf)
             inf_clip = np.linalg.norm(np.clip(actual_dq[t], -MAX_ABS_DQ, MAX_ABS_DQ), ord=np.inf)
-            print(f"[t={t}] |dq_des|_inf={inf_des:.02f}, |dq_raw|_inf={inf_raw:.2f}, |dq_clip|_inf={inf_clip:.2f}")
+            """print(f"[t={t}] |dq_des|_inf={inf_des:.02f}, |dq_raw|_inf={inf_raw:.2f}, |dq_clip|_inf={inf_clip:.2f}")"""
 
         if HEALTH_ASSERT_MM and IS_HEALTHY:
             pos_err_mm = 1e3 * float(np.linalg.norm(desired_ee[t][:3, 3] - actual_ee[t][:3, 3]))
