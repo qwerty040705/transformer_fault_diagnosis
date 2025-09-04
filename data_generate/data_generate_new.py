@@ -30,31 +30,48 @@ from control.impedance_controller import ImpedanceControllerMaximal
 from control.external_actuation import ExternalActuation
 
 
-FORCE_IDEAL_WHEN_HEALTHY = False
+# ─────────────────────────────────────────────────────────
+#   전역 플래그 
+# ─────────────────────────────────────────────────────────
+FORCE_IDEAL_WHEN_HEALTHY = True      # 고장 전: 분배/역매핑/제약 우회 (joint 토크 직주입)
+SNAP_Q_TO_DES_WHEN_HEALTHY = False   # 고장 전: 스냅 비활성(성능 검증 위해)
+HEALTH_ASSERT_MM = True              # 고장 전 mm 수준 어설션
+HEALTH_ERR_THRESH_MM = 20.0         
+
 CHECK_DISTRIBUTION_RESID = True
 DEBUG_TAU_PRINT = False
 
-# ── 제어/제약 파라미터(안정 우선) ─────────────────────────────────
-IK_MAX_DQ = 1.2
-TAU_LIM = 600.0            # (이전 900) 토크 절대 상한
-DTAU_MAX = 80.0            # (이전 140) 토크 rate 상한
-FN = 0.6
+# ── 제어/제약 파라미터 ─────────────────────────────────────
+TAU_LIM_HEALTHY = 900.0
+DTAU_MAX_HEALTHY = 120.0
+TAU_LIM_FAULTY = 600.0
+DTAU_MAX_FAULTY = 80.0
+
+FN_BASE = 4.0
 ZETA = 1.0
-K_VISC = 2.0               # 점성 감쇠 (Nm·s/rad) - dq에 곱해 빼줌
+K_VISC = 2.0
+KI_SCALE = 0.02
+INT_TAU_CLAMP_RATIO = 0.4
+AW_BETA = 0.6
 
-RESID_REL_WARN = 0.05
-SAT_WARN_RATIO = 0.10
+ERR_BOOST_START_MM = 15.0
+ERR_BOOST_SLOPE = 0.02
+ERR_BOOST_MAX = 2.0
 
-THRUST_BOUND_SCALE = 20.0  # (이전 100) actuator 상한 스케일다운
+THRUST_BOUND_SCALE = 20.0
 
-# 조인트 궤적 생성 파라미터 (너무 세게 안 튀도록 유지)
-VEL_MAX = 0.5             # rad/s (생성기 속도 상한, 의도적으로 낮춤)
-ACC_MAX = 5.0              # rad/s^2 (생성기 가속도 상한, 의도적으로 낮춤)
-VEL_NOISE_STD = 0.5
+VEL_MAX = 0.5
+ACC_MAX = 2.5
+VEL_NOISE_STD = 0.35
 VEL_DECAY = 0.95
 
 TRAJ_MIN_POS_DELTA = 0.0
 TRAJ_MIN_ROT_DELTA = 0.0
+
+MAX_ABS_DQ = 24.0
+
+PRINT_EVERY = 50
+tiny = 1e-9
 
 
 def _quiet_call(func, *args, **kwargs):
@@ -129,9 +146,31 @@ def compute_link_cumulative_from_rel(link_rel_list):
     return cum
 
 
-# ─────────────────────────────────────────────────────────
-#   조인트 한계 읽기 (+ 폴백)
-# ─────────────────────────────────────────────────────────
+def as_col(x, d):
+    arr = np.asarray(x, dtype=float)
+    if arr.ndim == 1:
+        if arr.size < d:
+            return np.pad(arr, (0, d - arr.size), mode="edge").reshape(d, 1)
+        return arr[:d].reshape(d, 1)
+    if arr.ndim == 2:
+        if arr.shape == (d, 1):
+            return arr
+        if arr.shape[0] == d and arr.shape[1] > 1:
+            col0 = arr[:, [0]]
+            if np.allclose(arr, col0, atol=1e-9, rtol=1e-6):
+                return col0
+            return np.mean(arr, axis=1, keepdims=True)
+        if arr.shape[0] > d and arr.shape[1] == 1:
+            return arr[:d, :]
+        if arr.shape[0] == d and arr.shape[1] == d:
+            return np.diag(arr).reshape(d, 1)
+    # fallback
+    flat = arr.reshape(-1)
+    if flat.size < d:
+        flat = np.pad(flat, (0, d - flat.size), mode="edge")
+    return flat[:d].reshape(d, 1)
+
+
 def get_joint_limits(model_param, dof):
     qmin = np.full((dof, 1), -np.pi)
     qmax = np.full((dof, 1),  np.pi)
@@ -153,9 +192,6 @@ def get_joint_limits(model_param, dof):
     return qmin, qmax
 
 
-# ─────────────────────────────────────────────────────────
-#   가능한(Feasible) 조인트 궤적 생성 (속도/가속/한계 보장)
-# ─────────────────────────────────────────────────────────
 def generate_feasible_joint_trajectory(dof, T, dt, qmin, qmax):
     rng = np.random.default_rng()
     mid = (qmin + qmax) / 2.0
@@ -196,9 +232,6 @@ def generate_feasible_joint_trajectory(dof, T, dt, qmin, qmax):
     return q, dq, ddq
 
 
-# =========================================================
-#               One sample generator (main loop)
-# =========================================================
 def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=None):
     if seed is not None:
         np.random.seed(seed)
@@ -229,7 +262,6 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
     external_controller = ExternalActuation(model_param, robot)
     external_controller.apply_selective_mapping = True
 
-    # actuator bound scale-down
     if hasattr(external_controller, "lp") and hasattr(external_controller, "qp"):
         if "ub" in external_controller.qp and "lb" in external_controller.qp:
             external_controller.qp["ub"] *= THRUST_BOUND_SCALE
@@ -238,7 +270,6 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
             external_controller.lp["ub"][:-1] *= THRUST_BOUND_SCALE
             external_controller.lp["lb"][:-1] *= THRUST_BOUND_SCALE
 
-    # mapping 튜닝값들 있으면 보수적으로
     for attr, val in [
         ("slack_weight", 1e4),
         ("slack_weight_lp", 1e4),
@@ -284,77 +315,124 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
 
     dt = float(dt)
     tau_prev = np.zeros((dof,))
-
-    # 내부 안전 제한(로봇쪽에서 ddq/dq 제한도 걸지만, 제어입력 단계에서도 완충)
-    MAX_ABS_DQ = 24.0      # 시뮬레이터 내부 클램프(로봇 클래스에도 존재)
-    PRINT_EVERY = 50
+    e_int = np.zeros((dof,))   
 
     for t in range(1, T):
         q = actual_q[t - 1]
         dq = actual_dq[t - 1]
         robot.set_joint_states(q, dq)
 
-        # PD gains by modal mass (impedance-like)
-        Mjj = np.diag(robot.Mass)
-        wn = 2 * np.pi * FN
-        Kp_vec = (wn ** 2) * Mjj
-        Kd_vec = (2 * ZETA * wn) * Mjj
+        is_faulty_vec = (label_matrix[t] == 0)
+        IS_HEALTHY = not np.any(is_faulty_vec)
 
-        e = (q_des[t] - q).reshape(-1)
-        de = (dq_des[t] - dq).reshape(-1)
+        e   = (q_des[t]  - q).reshape(-1)
+        de  = (dq_des[t] - dq).reshape(-1)
+        ddq =  ddq_des[t].reshape(-1)
 
-        tau_raw = (Kp_vec * e + Kd_vec * de) + robot.Grav.reshape(-1)
+        desired_ee[t] = fk_solver.compute_end_effector_frame(q_des[t, :, 0])
 
-        # 점성 감쇠 추가
-        tau_raw = tau_raw - K_VISC * dq.reshape(-1)
+        M = np.asarray(robot.Mass, dtype=float)
+        if M.ndim == 1:
+            M = np.diag(M)
+        elif M.ndim != 2:
+            M = np.diag(np.atleast_1d(M).reshape(-1))
+        if M.shape != (dof, dof):
+            M = np.eye(dof)
 
-        # 토크 하드/레이트 제한
-        tau_raw = np.clip(tau_raw, -TAU_LIM, TAU_LIM)
-        dtau = np.clip(tau_raw - tau_prev, -DTAU_MAX, DTAU_MAX)
-        tau = tau_prev + dtau
+        C_dq = np.zeros(dof)
+        try:
+            if hasattr(robot, "Coriolis") and robot.Coriolis is not None:
+                Cmat = np.asarray(robot.Coriolis, dtype=float)
+                if Cmat.ndim == 2 and Cmat.shape == (dof, dof):
+                    C_dq = Cmat @ dq.reshape(-1)
+            elif hasattr(robot, "Cdq") and robot.Cdq is not None:
+                v = np.asarray(robot.Cdq, dtype=float).reshape(-1)
+                if v.size == dof:
+                    C_dq = v
+        except Exception:
+            C_dq = np.zeros(dof)
+
+        G = np.asarray(robot.Grav, dtype=float).reshape(-1)
+        if G.size != dof:
+            G = np.zeros(dof)
+
+        wn = 2.0 * np.pi * FN_BASE
+        pos_err_mm_for_boost = 1e3 * float(np.linalg.norm(desired_ee[t][:3, 3] - fk_solver.compute_end_effector_frame(q[:, 0])[:3, 3]))
+        if IS_HEALTHY and pos_err_mm_for_boost > ERR_BOOST_START_MM:
+            boost = min(ERR_BOOST_MAX, 1.0 + ERR_BOOST_SLOPE * (pos_err_mm_for_boost - ERR_BOOST_START_MM))
+        else:
+            boost = 1.0
+        Kp0 = boost * (wn ** 2)
+        Kd0 = boost * (2.0 * ZETA * wn)
+        Ki0 = KI_SCALE * Kp0
+
+        e_int = e_int + e * dt
+        acc_I = Ki0 * e_int
+        tau_I_unsat = M @ acc_I
+        tau_lim_max = TAU_LIM_HEALTHY if IS_HEALTHY else TAU_LIM_FAULTY
+        tau_I_clip  = np.clip(tau_I_unsat, -INT_TAU_CLAMP_RATIO * tau_lim_max, INT_TAU_CLAMP_RATIO * tau_lim_max)
+        try:
+            Minv_for_I = np.linalg.inv(M)
+        except np.linalg.LinAlgError:
+            Minv_for_I = np.linalg.pinv(M)
+        e_int = (Minv_for_I @ tau_I_clip) / max(Ki0, tiny)
+
+        ddq_cmd = ddq + Kp0 * e + Kd0 * de + Ki0 * e_int
+        tau_cmd_unsat = M @ ddq_cmd + C_dq + G - K_VISC * dq.reshape(-1)
+
+        dtau_max = DTAU_MAX_HEALTHY if IS_HEALTHY else DTAU_MAX_FAULTY
+        tau_limited = np.clip(tau_cmd_unsat, -tau_lim_max, tau_lim_max)
+        dtau        = np.clip(tau_limited - tau_prev, -dtau_max, dtau_max)
+        tau         = tau_prev + dtau
+
+        aw_err_tau = tau - tau_cmd_unsat
+        try:
+            Minv_aw = np.linalg.inv(M)
+        except np.linalg.LinAlgError:
+            Minv_aw = np.linalg.pinv(M)
+        e_int = e_int + AW_BETA * (Minv_aw @ aw_err_tau) / max(Ki0, tiny) * dt
+        acc_I = Ki0 * e_int
+        tau_I_unsat = M @ acc_I
+        tau_I_clip  = np.clip(tau_I_unsat, -INT_TAU_CLAMP_RATIO * tau_lim_max, INT_TAU_CLAMP_RATIO * tau_lim_max)
+        e_int = (Minv_aw @ tau_I_clip) / max(Ki0, tiny)
+
         tau_prev = tau.copy()
 
-        if DEBUG_TAU_PRINT and t % 25 == 0:
-            print(f"[t={t}] |tau|_inf={np.linalg.norm(tau,ord=np.inf):.2f}")
+        if FORCE_IDEAL_WHEN_HEALTHY and IS_HEALTHY:
+            tau_odar = tau.copy()
+        else:
+            lam_cmd = external_controller.distribute_torque_lp(tau)
+            lam_apply = lam_cmd.copy()
+            faulty = (label_matrix[t] == 0)
+            if np.any(faulty):
+                eps = float(epsilon_scale)
+                ref = np.abs(lam_cmd) + 1e-9
+                noise_fault = np.random.normal(0.0, eps, size=lam_cmd.shape) * ref
+                lam_apply[faulty] = 0.0 * lam_cmd[faulty] + noise_fault[faulty]
+            for iL in range(link_count):
+                thrust_i = lam_apply[8 * iL : 8 * (iL + 1)].reshape(-1, 1)
+                robot.set_odar_body_wrench_from_thrust(thrust_i, iL)
+            tau_odar = robot.get_joint_torque_from_odars()
 
-        # 외력분배
-        lam_cmd = external_controller.distribute_torque_lp(tau)
+            if CHECK_DISTRIBUTION_RESID:
+                denom = np.linalg.norm(tau) + 1e-9
+                resid_rel = float(np.linalg.norm(tau_odar.reshape(-1) - tau) / denom)
+                sat_ratio = 0.0
+                if hasattr(external_controller, "lp") and "ub" in external_controller.lp and "lb" in external_controller.lp:
+                    ub = np.asarray(external_controller.lp["ub"]).reshape(-1)
+                    lb = np.asarray(external_controller.lp["lb"]).reshape(-1)
+                    if ub.size == lam_cmd.size + 1 and lb.size == lam_cmd.size + 1:
+                        ub = ub[:-1]
+                        lb = lb[:-1]
+                    sat_ratio = float(np.mean((lam_cmd >= ub - 1e-9) | (lam_cmd <= lb + 1e-9)))
+                if resid_rel > 0.05 and sat_ratio > 0.10:
+                    print(f"[WARN] t={t} mapping residual={resid_rel:.2f}")
 
-        # 고장 주입 (stuck-off + 약간의 노이즈)
-        lam_apply = lam_cmd.copy()
-        faulty = (label_matrix[t] == 0)
-        if np.any(faulty):
-            eps = float(epsilon_scale)
-            ref = np.abs(lam_cmd) + 1e-9
-            noise_fault = np.random.normal(0.0, eps, size=lam_cmd.shape) * ref
-            lam_apply[faulty] = 0.0 * lam_cmd[faulty] + noise_fault[faulty]
+        tau_in = as_col(tau_odar, dof)          
+        nxt = robot.get_next_joint_states(dt, tau_in)
+        qn = as_col(nxt["q"],  dof)             
+        dqn = as_col(nxt["dq"], dof)           
 
-        # 각 링크에 분배된 thrust → body wrench 세팅
-        for iL in range(link_count):
-            thrust_i = lam_apply[8 * iL : 8 * (iL + 1)].reshape(-1, 1)
-            robot.set_odar_body_wrench_from_thrust(thrust_i, iL)
-
-        tau_odar = robot.get_joint_torque_from_odars()
-
-        # 매핑 품질 체크
-        if CHECK_DISTRIBUTION_RESID:
-            denom = np.linalg.norm(tau) + 1e-9
-            resid_rel = float(np.linalg.norm(tau_odar - tau) / denom)
-            sat_ratio = 0.0
-            if hasattr(external_controller, "lp") and "ub" in external_controller.lp and "lb" in external_controller.lp:
-                ub = np.asarray(external_controller.lp["ub"]).reshape(-1)
-                lb = np.asarray(external_controller.lp["lb"]).reshape(-1)
-                if ub.size == lam_cmd.size + 1 and lb.size == lam_cmd.size + 1:
-                    ub = ub[:-1]
-                    lb = lb[:-1]
-                sat_ratio = float(np.mean((lam_cmd >= ub - 1e-9) | (lam_cmd <= lb + 1e-9)))
-            if resid_rel > RESID_REL_WARN and sat_ratio > SAT_WARN_RATIO:
-                print(f"[WARN] t={t} mapping residual={resid_rel:.2f} (consider tuning mapping/gains)")
-
-        nxt = robot.get_next_joint_states(dt, tau_odar)
-        qn, dqn = nxt["q"], nxt["dq"]
-
-        # 수치 보호: NaN/Inf 방지 + 속도 하드클립(세이프가드)
         if not (_is_finite(qn) and _is_finite(dqn)):
             qn, dqn = q, dq
         dqn = np.clip(dqn, -MAX_ABS_DQ, MAX_ABS_DQ)
@@ -362,26 +440,28 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
         actual_q[t], actual_dq[t] = qn, dqn
         robot.set_joint_states(qn, dqn)
 
-        desired_ee[t] = fk_solver.compute_end_effector_frame(q_des[t, :, 0])
-        actual_ee[t] = fk_solver.compute_end_effector_frame(qn[:, 0])
+        actual_ee[t]  = fk_solver.compute_end_effector_frame(qn[:, 0])
 
         link_rel_des, _ = compute_link_relatives_pure(fk_solver, q_des[t, :, 0])
         link_rel_act, _ = compute_link_relatives_pure(fk_solver, qn[:, 0])
         link_cum_des = compute_link_cumulative_from_rel(link_rel_des)
         link_cum_act = compute_link_cumulative_from_rel(link_rel_act)
-
         for k in range(link_count):
             desired_link_rel[t, k] = link_rel_des[k]
             actual_link_rel[t, k] = link_rel_act[k]
             desired_link_cum[t, k] = link_cum_des[k]
             actual_link_cum[t, k] = link_cum_act[k]
 
-        # 상태 모니터
         if t % PRINT_EVERY == 0:
             inf_des = np.linalg.norm(dq_des[t], ord=np.inf)
-            inf_raw = np.linalg.norm(actual_dq[t], ord=np.inf)  # 방금 업데이트 후
+            inf_raw = np.linalg.norm(actual_dq[t], ord=np.inf)
             inf_clip = np.linalg.norm(np.clip(actual_dq[t], -MAX_ABS_DQ, MAX_ABS_DQ), ord=np.inf)
             print(f"[t={t}] |dq_des|_inf={inf_des:.02f}, |dq_raw|_inf={inf_raw:.2f}, |dq_clip|_inf={inf_clip:.2f}")
+
+        if HEALTH_ASSERT_MM and IS_HEALTHY:
+            pos_err_mm = 1e3 * float(np.linalg.norm(desired_ee[t][:3, 3] - actual_ee[t][:3, 3]))
+            if pos_err_mm > HEALTH_ERR_THRESH_MM + 1e-9:
+                raise AssertionError(f"[HEALTHY] EE pos err {pos_err_mm:.2f} mm @ t={t} (threshold {HEALTH_ERR_THRESH_MM} mm)")
 
     return (
         desired_ee,
@@ -548,7 +628,7 @@ if __name__ == "__main__":
         NUM_SAMPLES = int(input("How many samples?: ").strip())
     except Exception:
         NUM_SAMPLES = 10
-    workers = os.cpu_count() or 1           # 최대 사용 (논리 코어 전부)
+    workers = os.cpu_count() or 1
     print(f"Spawning {workers} worker(s)... (MAX)", flush=True)
     try:
         epsilon_scale = float(input("Epsilon scale (0 for none) [default 0.0]: ").strip())
