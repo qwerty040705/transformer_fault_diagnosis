@@ -555,7 +555,7 @@ if __name__ == "__main__":
 python3 causal_tcn/visualize_stream_causal_tcn.py \
   --ckpt TCN/TCN_link_3_RELonly_CAUSAL.pth \
   --npz  data_storage/link_3/fault_dataset.npz \
-  --seq_idx 22 \
+  --seq_idx 23 \
   --threshold 0.5 \
   --kofn 3,5 \
   --data_hz 100 --speed 1.0 \

@@ -1,27 +1,77 @@
+# control/external_actuation.py
+
 import numpy as np
+import numpy.linalg as npl
 from scipy.sparse import block_diag
 from scipy.optimize import linprog
+from dataclasses import dataclass
 from control.selective_mapping import SelectiveMapping
 
 
 class ExternalActuation:
-    MAT_CLIP = 1e8   
-    VEC_CLIP = 1e8   
+    """
+    외부 추력 분배기 (MATLAB 호환 + 논문식 per-link 옵션)
+
+    주요 사용법:
+      1) MATLAB식(기본): distribute_joint_linf(tau_joint)
+         - 목적:  min ||λ||_inf
+         - 제약:  D^T B λ = τ_joint,   lb ≤ λ ≤ ub
+         - τ_joint: (d,) 또는 (d,1)  (d = dof)
+
+      2) 논문식 per-link: distribute_wrench_linf(tau6L)
+         - 각 링크 i에 대해:  min ||λ_i||_inf  s.t.  B_i^(τf) λ_i = τ_i,  lb_i ≤ λ_i ≤ ub_i
+         - τ_i ∈ R^6 ([τ; f] 순서), τ6L는 (6L,) 스택
+
+    공통:
+      - B_i는 원래 [f; τ]라고 가정 → swap 행렬로 [τ; f] 정렬 후 사용
+      - 선택적 selective mapping 후처리 지원(비활성화 권장: 등식 보장 깨질 수 있음)
+    """
+    MAT_CLIP = 1e8
+    VEC_CLIP = 1e8
+
+    @dataclass
+    class PerLinkAlloc:
+        Bp: np.ndarray       # (6×m_i)  [τ; f] 순서로 정렬된 B_i
+        pinvBp: np.ndarray   # (m_i×6)
+        N: np.ndarray        # (m_i×r)  nullspace 방향 (Bnsv를 B-nullspace로 정사영)
+        lb: np.ndarray       # (m_i,)
+        ub: np.ndarray       # (m_i,)
 
     def __init__(self, params_model, lasdra_model):
+        # --- 모델/파라미터 ---
         self.lasdra = lasdra_model
-        self.nlinks = len(params_model["ODAR"])
-        self.smaps = [SelectiveMapping(params_model["ODAR"][i]) for i in range(self.nlinks)]
+        self.odars = params_model["ODAR"]
+        self.nlinks = len(self.odars)
 
-        self.B_blkdiag = self._build_B_blkdiag(params_model)
+        # SelectiveMapping: 두 가지 시그니처 모두 대응
+        try:
+            self.smaps = [SelectiveMapping(self.odars[i]) for i in range(self.nlinks)]
+        except TypeError:
+            self.smaps = [SelectiveMapping(self.nlinks, i) for i in range(self.nlinks)]
+        self.apply_selective_mapping = False  # 등식 보장을 원하면 False 유지 권장
+
+        # [τ; f] ↔ [f; τ] swap
+        self._swap = np.block([
+            [np.zeros((3, 3)), np.eye(3)],
+            [np.eye(3), np.zeros((3, 3))]
+        ])
+
+        # --- 전역 B (블록대각, [τ; f] 정렬) ---
+        self.B_blkdiag = self._build_B_blkdiag(params_model)    # (6L × m)
         self.B_blkdiag = self._sanitize_mat(self.B_blkdiag, clip=self.MAT_CLIP)
+        self.m_total = self.B_blkdiag.shape[1]
 
-        self.lambda_set_prev = None
-        self.apply_selective_mapping = False
+        # --- per-link 할당기(논문식용) ---
+        self.allocs = self._build_per_link_allocators()
 
-        self._init_lp_variables(params_model)
-        self._init_qp_variables(params_model)
+        # --- 경계/LP 변수 (MATLAB식 전역 LP용) ---
+        self.ub_global = self._generate_thrust_bounds(params_model)  # (m,)
+        self.lb_global = -self.ub_global
+        self._init_joint_linf_lp()
 
+        self.lambda_set_prev = None  # warm start 용도(옵션)
+
+    # ───────────── 유틸 ─────────────
     @staticmethod
     def _sanitize_mat(M, clip=1e8):
         M = np.asarray(M, dtype=float)
@@ -38,158 +88,207 @@ class ExternalActuation:
             v = np.clip(v, -clip, clip)
         return v
 
-    @staticmethod
-    def _safe_solve(A, b):
-        try:
-            return np.linalg.solve(A, b)
-        except np.linalg.LinAlgError:
-            return np.linalg.pinv(A) @ b
-
     @classmethod
     def _safe_matvec(cls, M, v, mat_clip=None, vec_clip=None):
         M = cls._sanitize_mat(M, clip=mat_clip if mat_clip is not None else cls.MAT_CLIP)
         v = cls._sanitize_vec(v, clip=vec_clip if vec_clip is not None else cls.VEC_CLIP)
         with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
             y = M @ v
-        y = cls._sanitize_vec(y, clip=vec_clip if vec_clip is not None else cls.VEC_CLIP)
-        return y
+        return cls._sanitize_vec(y, clip=vec_clip if vec_clip is not None else cls.VEC_CLIP)
 
-    # ---------- 내부 구성 ----------
+    # ───────────── 내부 구성 ─────────────
     def _build_B_blkdiag(self, params_model):
-        B_blocks = [np.asarray(odar.B, dtype=float) for odar in params_model["ODAR"]]
+        # 각 링크 B_i: [f; τ] → [τ; f] 로 정렬
+        B_blocks = [self._swap @ np.asarray(odar.B, dtype=float) for odar in params_model["ODAR"]]
         return block_diag(B_blocks).toarray()
 
     def _generate_thrust_bounds(self, params_model):
         ub = []
         for odar in params_model["ODAR"]:
-            ub.extend([float(odar.max_thrust)] * odar.B.shape[1])
+            ub.extend([float(odar.max_thrust)] * np.asarray(odar.B).shape[1])
         return np.asarray(ub, dtype=float)
 
-    def _init_qp_variables(self, params_model):
-        m = self.B_blkdiag.shape[1]
-        self.qp = {}
-        self.qp["ub"] = self._generate_thrust_bounds(params_model)  
-        self.qp["lb"] = -self.qp["ub"]                              
-
-    def _init_lp_variables(self, params_model):
-        m = self.B_blkdiag.shape[1]
+    def _init_joint_linf_lp(self):
+        """
+        전역 LP (MATLAB distributeTorqueLP 동일 구조)
+          min s
+          s.t. D^T B λ = τ_joint
+               -s ≤ λ_i ≤ s
+               lb ≤ λ ≤ ub
+        """
+        m = self.m_total
         self.lp = {}
+        # 목적: [zeros(m), 1] @ [λ; s]
         self.lp["c"] = np.concatenate([np.zeros(m), [1.0]])
-
-        A_ub_box = np.vstack([
-            np.hstack([ np.eye(m), -np.ones((m, 1))]), 
-            np.hstack([-np.eye(m), -np.ones((m, 1))]),  
+        # -s ≤ λ ≤ s  →  [ I | -1] [λ;s] ≤ 0  및 [-I | -1][λ;s] ≤ 0
+        self.lp["A_box"] = np.vstack([
+            np.hstack([ np.eye(m), -np.ones((m, 1))]),
+            np.hstack([-np.eye(m), -np.ones((m, 1))]),
         ])
-        b_ub_box = np.zeros(2 * m)
-        self.lp["A_ub_box"] = A_ub_box
-        self.lp["b_ub_box"] = b_ub_box
+        self.lp["b_box"] = np.zeros(2 * m)
+        # 경계: lb ≤ λ ≤ ub,  s ≥ 0
+        self.lp["bounds"] = list(zip(np.append(self.lb_global, 0.0),
+                                     np.append(self.ub_global, np.inf)))
 
-        ub = self._generate_thrust_bounds(params_model)
-        lb = -ub
-        self.lp["bounds_init"] = list(zip(np.append(lb, 0.0), np.append(ub, np.inf)))
+    def _build_per_link_allocators(self):
+        allocs = []
+        for odar in self.odars:
+            # [τ; f] 정렬된 per-link B
+            Bp = self._swap @ np.asarray(odar.B, dtype=float)      # (6×m_i)
+            Bp = self._sanitize_mat(Bp, clip=self.MAT_CLIP)
+            pinvBp = npl.pinv(Bp, rcond=1e-9)
 
-    def distribute_torque_lp(self, torque, max_expand_tries=3, tol_eq=1e-8):
+            # Bnsv 기반 nullspace 방향을 B-nullspace로 정사영
+            u = np.asarray(odar.Bnsv['upper'], dtype=float).reshape(-1, 1)  # (m_i,1)
+            v = np.asarray(odar.Bnsv['lower'], dtype=float).reshape(-1, 1)  # (m_i,1)
+            I = np.eye(Bp.shape[1])
+            Pn = I - pinvBp @ Bp
+            N = Pn @ np.hstack([u, v])
+            keep = [j for j in range(N.shape[1]) if npl.norm(N[:, j]) > 1e-8]
+            N = N[:, keep] if keep else np.zeros((Bp.shape[1], 0))
+
+            # 박스 제약
+            ub = float(odar.max_thrust) * np.ones((Bp.shape[1],), dtype=float)
+            lb = -ub
+            allocs.append(self.PerLinkAlloc(Bp= Bp, pinvBp= pinvBp, N= N, lb= lb, ub= ub))
+        return allocs
+
+    # ───────────── per-link l∞ + box + nullspace (논문식) ─────────────
+    @staticmethod
+    def _per_link_linf_min(lambda0, N, lb, ub):
         """
-        torque: (ndof,) 또는 (ndof,1)
-        반환: λ (m,)
+        min s
+        s.t.  -s ≤ λ0 + Nα ≤ s
+              lb ≤ λ0 + Nα ≤ ub
         """
-        D = self._sanitize_mat(self.lasdra.D, clip=self.MAT_CLIP)
-        B = self.B_blkdiag  
+        m = lambda0.size
+        r = N.shape[1] if N.size else 0
+        if r == 0:
+            return np.clip(lambda0, lb, ub)
 
-        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
-            Aeq = D.T @ B
-        Aeq = self._sanitize_mat(Aeq, clip=self.MAT_CLIP)
+        A_ub = np.vstack([
+            np.hstack([  N, -np.ones((m, 1))]),   #  Nα - s ≥ -λ0
+            np.hstack([ -N, -np.ones((m, 1))]),   # -Nα - s ≥  λ0
+            np.hstack([  N,  np.zeros((m, 1))]),  #  Nα ≥ lb-λ0
+            np.hstack([ -N,  np.zeros((m, 1))]),  # -Nα ≥ -(ub-λ0)
+        ])
+        b_ub = np.concatenate([
+            -lambda0,
+             lambda0,
+            (lb - lambda0),
+           -(ub - lambda0),
+        ])
+        c = np.zeros(r + 1); c[-1] = 1.0
+        try:
+            res = linprog(c=c, A_ub=A_ub, b_ub=b_ub,
+                          bounds=[(None, None)] * r + [(0, None)],
+                          method="highs")
+            if res is not None and res.success:
+                alpha = res.x[:r]
+                lam = lambda0 + (N @ alpha)
+                return np.clip(lam, lb, ub)
+        except Exception:
+            pass
+        return np.clip(lambda0, lb, ub)
 
-        beq = self._sanitize_vec(torque, clip=self.VEC_CLIP)
+    # ───────────── 공개 API ① : MATLAB식 전역 LP (D 포함) ─────────────
+    def distribute_joint_linf(self, tau_joint):
+        """
+        MATLAB distributeTorqueLP와 동일:
+          min ||λ||_inf
+          s.t.  D^T B λ = τ_joint,   lb ≤ λ ≤ ub
 
-        m = B.shape[1]
-        lb = self._sanitize_vec(self.qp["lb"], clip=self.VEC_CLIP)
-        ub = self._sanitize_vec(self.qp["ub"], clip=self.VEC_CLIP)
+        tau_joint : (d,) or (d,1)  (joint torque vector)
+        return    : (m,)  (all rotor thrusts)
+        """
+        tau_joint = self._sanitize_vec(tau_joint, clip=self.VEC_CLIP)
+        D = self._sanitize_mat(self.lasdra.D, clip=self.MAT_CLIP)      # (6L×d)
+        D_s  = self._sanitize_mat(D, clip=self.MAT_CLIP)
+        B_s  = self._sanitize_mat(self.B_blkdiag, clip=self.MAT_CLIP)
+        Aeq  = self._sanitize_mat(D_s.T @ B_s, clip=self.MAT_CLIP)  # (d×m)
 
-        def make_bounds(lb_, ub_):
-            return list(zip(np.append(lb_, 0.0), np.append(ub_, np.inf)))
 
+        # 확장변수 [λ; s]
         A_eq_ext = np.hstack([Aeq, np.zeros((Aeq.shape[0], 1))])
+        try:
+            res = linprog(
+                c=self.lp["c"],
+                A_ub=self.lp["A_box"], b_ub=self.lp["b_box"],
+                A_eq=A_eq_ext, b_eq=tau_joint,
+                bounds=self.lp["bounds"],
+                method="highs",
+            )
+        except Exception:
+            res = None
 
-        for attempt in range(max_expand_tries + 1):
-            try:
-                res = linprog(
-                    c=self.lp["c"],
-                    A_ub=self.lp["A_ub_box"], b_ub=self.lp["b_ub_box"],
-                    A_eq=A_eq_ext, b_eq=beq,
-                    bounds=make_bounds(lb, ub),
-                    method="highs",
-                )
-            except Exception:
-                res = None
-
-            if (res is not None) and res.success:
-                lam = self._sanitize_vec(res.x[:-1], clip=self.VEC_CLIP)
-
-                resid = self._safe_matvec(Aeq, lam) - beq
-                if np.linalg.norm(resid, ord=np.inf) <= tol_eq:
-                    if self.apply_selective_mapping:
-                        Fodar = self._safe_matvec(self.B_blkdiag, lam)
-                        lam = self._adjust_thrust_across_links(Fodar)
-                        lam = self._sanitize_vec(lam, clip=self.VEC_CLIP)
-
-                    lam = np.clip(lam, lb, ub)
-                    self.qp["lb"], self.qp["ub"] = lb.copy(), ub.copy()
-                    self.lambda_set_prev = lam.copy()
-                    return lam
-
-            if attempt < max_expand_tries:
-                lb *= 2.0
-                ub *= 2.0
-                lb = self._sanitize_vec(lb, clip=self.VEC_CLIP)
-                ub = self._sanitize_vec(ub, clip=self.VEC_CLIP)
-
-        lam = self._least_squares_fallback(beq, Aeq, lb, ub)
+        if (res is None) or (not res.success):
+            # 간단한 fallback: 최소제곱 후 박스 클립(등식 정확도는 떨어질 수 있음)
+            lam_ls = npl.pinv(Aeq, rcond=1e-9) @ tau_joint
+            lam_ls = np.clip(lam_ls, self.lb_global, self.ub_global)
+            lam = self._sanitize_vec(lam_ls, clip=self.VEC_CLIP)
+        else:
+            lam = self._sanitize_vec(res.x[:-1], clip=self.VEC_CLIP)
 
         if self.apply_selective_mapping:
+            # 주의: 후처리는 등식을 깨뜨릴 수 있음. False 권장.
             Fodar = self._safe_matvec(self.B_blkdiag, lam)
-            lam = self._adjust_thrust_across_links(Fodar)
-            lam = self._sanitize_vec(lam, clip=self.VEC_CLIP)
+            lam = self._apply_selective_mapping_from_F(Fodar)
 
-        lam = np.clip(lam, lb, ub)
-        self.qp["lb"], self.qp["ub"] = lb.copy(), ub.copy()
         self.lambda_set_prev = lam.copy()
         return lam
 
-    def _least_squares_fallback(self, beq, Aeq, lb, ub, max_iter=8, mu=1e-6, tol=1e-4):
-        Aeq = self._sanitize_mat(Aeq, clip=self.MAT_CLIP)
-        beq = self._sanitize_vec(beq, clip=self.VEC_CLIP)
-        lb  = self._sanitize_vec(lb,  clip=self.VEC_CLIP)
-        ub  = self._sanitize_vec(ub,  clip=self.VEC_CLIP)
+    # ───────────── 공개 API ② : 논문식 per-link (D 미포함) ─────────────
+    def distribute_wrench_linf(self, tau6L):
+        """
+        각 링크별 6D 렌치 τ_i=[τ; f]가 주어졌을 때,
+        링크 i마다  min ||λ_i||_inf  s.t.  B_i^(τf) λ_i = τ_i,  lb_i ≤ λ_i ≤ ub_i
+        """
+        tau6L = self._sanitize_vec(tau6L, clip=self.VEC_CLIP)
+        assert tau6L.size == 6 * self.nlinks, f"tau size {tau6L.size} but expected 6*{self.nlinks}"
 
-        At = Aeq.T
-        M = self._sanitize_mat(Aeq @ At + mu * np.eye(Aeq.shape[0]), clip=self.MAT_CLIP)
-        y = self._safe_solve(M, beq)
-        lam = self._sanitize_vec(At @ y, clip=self.VEC_CLIP)
+        lam_list = []
+        for i, alloc in enumerate(self.allocs):
+            ti = tau6L[i * 6:(i + 1) * 6]                 # (6,)
+            lambda0 = alloc.pinvBp @ ti                   # min-norm
+            lam_i   = self._per_link_linf_min(lambda0, alloc.N, alloc.lb, alloc.ub)
+            lam_list.append(lam_i)
 
-        for _ in range(max_iter):
-            lam = np.clip(lam, lb, ub)
-            r = beq - self._safe_matvec(Aeq, lam)
-            if np.linalg.norm(r, ord=np.inf) < tol:
-                break
-            y = self._safe_solve(M, r)
-            lam = self._sanitize_vec(lam + At @ y, clip=self.VEC_CLIP)
+        lam = np.concatenate(lam_list, axis=0)
+        lam = self._sanitize_vec(lam, clip=self.VEC_CLIP)
 
-        return np.clip(lam, lb, ub)
+        if self.apply_selective_mapping:
+            lam = self._apply_selective_mapping_from_tau(tau6L)
 
-    def _adjust_thrust_across_links(self, Fodar):
-        Fodar = self._sanitize_vec(Fodar, clip=self.VEC_CLIP)
+        self.lambda_set_prev = lam.copy()
+        return lam
+
+    # ───────────── 선택적 후처리 (등식 보장 깨질 수 있음) ─────────────
+    def _apply_selective_mapping_from_tau(self, tau6L):
+        thrusts = []
+        for i in range(self.nlinks):
+            ti = tau6L[i * 6:(i + 1) * 6]
+            wrench = {"torque": ti[:3], "force": ti[3:]}  # [τ; f]
+            thrusts.append(self.smaps[i].get_adjusted_thrust(wrench))
+        return self._sanitize_vec(np.concatenate(thrusts, axis=0), clip=self.VEC_CLIP)
+
+    def _apply_selective_mapping_from_F(self, Fodar):
         thrusts = []
         for i in range(self.nlinks):
             Fi = Fodar[i * 6:(i + 1) * 6]
             if Fi.shape[0] != 6:
                 Fi = np.zeros(6, dtype=float)
-            wrench = self._convert_matrix_to_wrench(Fi)
+            wrench = {"torque": Fi[:3], "force": Fi[3:]}  # [τ; f]
             thrusts.append(self.smaps[i].get_adjusted_thrust(wrench))
-        lam_adj = np.concatenate(thrusts, axis=0)
-        return self._sanitize_vec(lam_adj, clip=self.VEC_CLIP)
+        return self._sanitize_vec(np.concatenate(thrusts, axis=0), clip=self.VEC_CLIP)
 
-    @staticmethod
-    def _convert_matrix_to_wrench(F):
-        F = np.asarray(F, dtype=float).reshape(-1)
-        return {"torque": F[:3], "force": F[3:]}
+    # ───────────── 디버그 헬퍼 ─────────────
+    def reconstruct_joint_torque(self, lam):
+        """ D^T B λ 계산(공동식 등식 잔차 확인용) """
+        D = self._sanitize_mat(self.lasdra.D, clip=self.MAT_CLIP)
+        lam = self._sanitize_vec(lam, clip=self.VEC_CLIP)
+        return self._safe_matvec(D.T @ self.B_blkdiag, lam)
+
+    def reconstruct_link_wrench(self, lam):
+        """ B λ (링크 렌치 복원) """
+        lam = self._sanitize_vec(lam, clip=self.VEC_CLIP)
+        return self._safe_matvec(self.B_blkdiag, lam)

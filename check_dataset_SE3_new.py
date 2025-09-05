@@ -15,9 +15,6 @@ def rot_angle(R_err):
     c = max(-1.0, min(1.0, (tr - 1.0) / 2.0))  # numerical safety
     return float(np.arccos(c))
 
-def print_T(name, T):
-    print(f"{name}:\n{T}")
-
 # ---------- I/O ----------
 link_count = int(input("How many links do you want to check?: ").strip())
 data_dir = os.path.join("data_storage", f"link_{link_count}")
@@ -26,34 +23,35 @@ data_path = os.path.join(data_dir, "fault_dataset.npz")
 if not os.path.exists(data_path):
     raise FileNotFoundError(f"{data_path} not found.")
 
-data = np.load(data_path)
+# ✅ allow_pickle=True 로 object 배열 로드 허용
+data = np.load(data_path, allow_pickle=True)
 
 # ====== Keys ======
 has_rel = ('desired_link_rel' in data.files) and ('actual_link_rel' in data.files)
 has_cum = ('desired_link_cum' in data.files) and ('actual_link_cum' in data.files)
-
 if not has_cum:
     raise KeyError("Dataset must include desired_link_cum / actual_link_cum to reconstruct EE.")
 
 desired_link_rel = data['desired_link_rel'] if has_rel else None
 actual_link_rel  = data['actual_link_rel']  if has_rel else None
-desired_link_cum = data['desired_link_cum']
-actual_link_cum  = data['actual_link_cum']
+desired_link_cum = data['desired_link_cum']           # (S,T,N,4,4)
+actual_link_cum  = data['actual_link_cum']            # (S,T,N,4,4)
 
-# EE = 마지막 누적변환 (T_{0->N})
-desired_ee = desired_link_cum[:, :, -1]  # (S,T,4,4)
-actual_ee  = actual_link_cum[:, :, -1]
-
-# required label
-label = data['label']  # (S,T,8*link_count)
+# ✅ label이 object 배열이면 numeric으로 스택 (S,T,8*link_count)
+label = data['label']
+if label.dtype == object:
+    # 각 원소는 (T,8N) 혹은 (T,M) 형태라고 가정
+    label = np.stack([np.asarray(x) for x in label], axis=0)
+label = label.astype(np.int32, copy=False)
 
 # meta
-if 'dof' in data.files:
-    dof = int(data['dof'])
-else:
-    dof = link_count
+dof = int(data['dof']) if 'dof' in data.files else link_count
 
 # ---------- Shapes / format ----------
+# EE = 마지막 누적변환 (T_{0->N})
+desired_ee = desired_link_cum[:, :, -1]   # (S,T,4,4)
+actual_ee  = actual_link_cum[:, :, -1]    # (S,T,4,4)
+
 S, T, _, _ = desired_ee.shape
 motor_count = label.shape[2]
 

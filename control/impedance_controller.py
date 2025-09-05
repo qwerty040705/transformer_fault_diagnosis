@@ -1,3 +1,5 @@
+# /Users/dnbn/code/transformer_fault_diagnosis/control/impedance_controller.py
+
 import numpy as np
 
 class ImpedanceControllerMaximal:
@@ -68,6 +70,8 @@ class ImpedanceControllerMaximal:
         e_x, e_v = self.compute_position_error(xs, v_s, dt)
         e_r, e_w = self.compute_orientation_error(Rb, w_b, dt)
         wrench = self.get_control_output_using_gain(e_x, self.e_i, e_v, e_r, self.e_ri, e_w, w_b)
+
+        # 중력 보상 + feedforward 가속도
         wrench['force'] -= self.mass * self.g
         wrench['force'] += self.mass * self.get_linear_acceleration(self.position_desired_buffer, dt)
         return wrench
@@ -120,7 +124,8 @@ class ImpedanceControllerMaximal:
             coeffs = np.array([0.5, -2, 1.5])
         else:
             coeffs = np.array([-1/3, 1.5, -3, 11/6])
-        return np.dot(np.array(position_buffer).T, coeffs) / dt
+        pos_mat = np.vstack(position_buffer).T  # shape (3,n)
+        return (pos_mat @ coeffs) / dt
 
     def get_linear_acceleration(self, position_buffer, dt):
         n = len(position_buffer)
@@ -132,14 +137,20 @@ class ImpedanceControllerMaximal:
             coeffs = np.array([1, -2, 1])
         else:
             coeffs = np.array([-1, 4, -5, 2])
-        return np.dot(np.array(position_buffer).T, coeffs) / (dt**2)
+        pos_mat = np.vstack(position_buffer).T  # shape (3,n)
+        return (pos_mat @ coeffs) / (dt**2)
 
     def get_body_angular_velocity(self, R1, R2, dt):
         return 0.5 * self.unskew(R1.T @ R2 - R2.T @ R1) / dt
 
     @staticmethod
     def unskew(M):
-        return np.array([M[2,1], M[0,2], M[1,0]])
+        # 표준 unskew 연산 (skew-symmetric → 벡터)
+        return np.array([
+            M[2, 1] - M[1, 2],
+            M[0, 2] - M[2, 0],
+            M[1, 0] - M[0, 1]
+        ])
 
     @staticmethod
     def bound(q, q_min, q_max):
