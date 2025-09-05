@@ -295,7 +295,7 @@ if __name__ == "__main__":
     views_per_seq = 3       # 한 시퀀스에서 뽑는 윈도우 수(누적x2 + 슬라이딩x1 느낌)
     batch_size = batch_seq  # collate 후에는 배치가 batch_seq*views_per_seq 로 늘어남
     epochs = 200
-    lr, wd, seed = 1e-3, 1e-4, 42
+    lr, wd, seed = 1e-4, 1e-4, 42
     min_L = 32
     lookback_cap = 512      # 슬라이딩 윈도우 최대 길이(온라인 lookback 감각)
     LAMBDA_FP = 0.05

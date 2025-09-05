@@ -247,8 +247,11 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
       1) CLIK로 q_des(t) 궤적 생성
       2) CentralizedController 로 joint-space τ_joint(t) 산출 (q_des 추종)
       3) 외부 추력 분배기(전역 LP): D^T B λ = τ_joint  → λ(t)
-      4) 실제 적용 토크: τ_apply = D^T B λ  (joint 외력 잔차 = 0 수렴)
+      4) 실제 적용 토크: τ_apply = D^T B λ
       5) 고장(mask) 적용 후 동역학 적분
+
+    ★ FREEZE MODE: t₀ 이후엔 LP를 다시 풀지 않는다. t₀ 직전 λ를 복사해
+      고장 컬럼만 0으로 만든 뒤 그 λ를 마지막까지 그대로 적용.
     """
     if seed is not None:
         np.random.seed(seed)
@@ -291,8 +294,16 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
         lam_dummy, epsilon_scale=epsilon_scale, return_labels=True
     )
     label_matrix = np.asarray(label_matrix, dtype=np.int32)  # (T, 8*link_count)
+    which_mask = np.asarray(which_mask, dtype=np.int32)      # (8*link_count,)
     first_fault_t = first_fault_time_from_labels(label_matrix)
     onset_vec = onset_vector_from_labels(label_matrix)       # (8L,)
+
+    # ==== FREEZE MODE 상태변수 ====
+    lam_prev: np.ndarray | None = None     # t₀ 직전 분배
+    lam_frozen: np.ndarray | None = None   # t₀~끝까지 고정 분배
+    fault_has_triggered = False
+    faulty_cols = np.where(which_mask == 1)[0]  # inject에서 고장 모터 컬럼(들)
+    t0_fault = int(first_fault_t) if first_fault_t < 10**9 else None
 
     # ----- 버퍼 -----
     q_des  = np.zeros((T, dof, 1)); dq_des = np.zeros_like(q_des)
@@ -340,7 +351,7 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
         for k in range(link_count):
             desired_link_rel[t, k] = lr_des[k]; desired_link_cum[t, k] = lc_des[k]
 
-        # (2-1) EE-PD 렌치(선택적): 추적 성능 모니터만, 실제 토크 산출은 PID로 통일
+        # (2-1) EE-PD 렌치(선택적)
         T_now_des = desired_ee[t]
         Rd, pd = T_des[:3,:3], T_des[:3,3]
         Rn, pn = T_now_des[:3,:3], T_now_des[:3,3]
@@ -351,15 +362,16 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
         prev_e_r, prev_e_x = e_r.copy(), e_x.copy()
         # F_des = ee_pd_wrench(e_r, e_x, de_r, de_x)  # 로그용이면 활성화
 
-        # ------------------------ 핵심 변경: q→τ (PID) ------------------------
-        # 목표 상태 세팅
+        # ---------------- q→τ (PID) ----------------
         cc.set_desired_state({"q": q_des[t], "dq": dq_des[t]})
-        # 현재 실제 상태에서 joint torque 요구량 계산
         tau_joint_cmd = cc.compute_tau(dt, q_act[t-1], dq_act[t-1])   # (d,1)
         tau_joint_cmd = clip_inf_norm(tau_joint_cmd, 5e4).reshape(-1)
 
         # (3) 고장 전 bypass: Desired==Actual 보장(학습 안정화용)
-        if bypass_Blambda and (t < first_fault_t):
+        if bypass_Blambda and (t0_fault is not None) and (t < t0_fault):
+            # ==== FREEZE MODE: t == t₀-1 에서 미리 λ 계산해 둔다 ====
+            if t == (t0_fault - 1):
+                lam_prev = ext_act.distribute_joint_linf(tau_joint_cmd)  # D^T B λ = τ
             q_act[t]  = q_des[t]
             dq_act[t] = dq_des[t]
             robot.set_joint_states(q_act[t], dq_act[t])
@@ -368,21 +380,35 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
             actual_link_cum[t] = desired_link_cum[t]
             continue
 
-        # --------------------- 외부 추력 전역 LP (MATLAB 동일) ---------------------
-        # 현재 '실제 상태'에서의 D 사용을 위해, robot 상태는 q_act[t-1], dq_act[t-1] 로 유지
-        lam_cmd = ext_act.distribute_joint_linf(tau_joint_cmd)  # solves D^T B λ = τ
+        # ---------------- 분배 λ 계산/적용 (FREEZE MODE) ----------------
+        # 주의: t₀ 이후엔 LP 호출 금지. t₀ 직전 λ(lam_prev)를 고정 사용.
+        if (t0_fault is not None) and (t >= t0_fault):
+            if not fault_has_triggered:
+                # 첫 고장 시점 진입
+                if lam_prev is None:
+                    # 예외상황(바이패스 OFF이거나 t₀=1 등) 대비: 직전이 없으면 최소 한 번은 계산
+                    lam_prev = ext_act.distribute_joint_linf(tau_joint_cmd)
+                lam_frozen = lam_prev.copy()
+                if faulty_cols.size > 0:
+                    lam_frozen[faulty_cols] = 0.0
+                fault_has_triggered = True
+            lam_applied = lam_frozen
+        else:
+            # 고장 전(바이패스 OFF인 경우만 도달): 평소처럼 LP
+            lam_cmd = ext_act.distribute_joint_linf(tau_joint_cmd)  # solves D^T B λ = τ
+            lam_prev = lam_cmd.copy()  # t₀-1에서 이 값이 얼려진다
+            lam_applied = lam_cmd
 
-        # (5) 라벨(고장) 적용
-        lam_applied = lam_cmd.copy()
-        row = label_matrix[t].reshape(-1)
-        if row.size == lam_applied.size:
-            lam_applied[row == 0] = 0.0
+        # (안전) 고장 이후에는 고장 컬럼이 항상 0이어야 함
+        if fault_has_triggered and faulty_cols.size > 0:
+            # float 비교이므로 == 0.0 사용해도 무방(우리가 직접 0.0 대입)
+            assert np.all(lam_applied[faulty_cols] == 0.0)
 
         # (6) 실제 τ 재계산 (같은 실제 상태의 A = DᵀB)
         D_now = np.asarray(robot.D, dtype=float)     # (6L×d)
         D_now_s = ext_act._sanitize_mat(D_now, clip=ext_act.MAT_CLIP)
         B_blk_s = ext_act._sanitize_mat(B_blk,  clip=ext_act.MAT_CLIP)
-        Aeq_now = D_now_s.T @ B_blk_s  
+        Aeq_now = D_now_s.T @ B_blk_s
         tau_apply = (Aeq_now @ lam_applied.reshape(-1,1)).reshape(dof,1)
 
         # (7) 동역학 적분 (현재 실제 상태에서)
@@ -402,10 +428,10 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
             actual_link_rel[t, k]  = lr_act[k]
             actual_link_cum[t, k]  = lc_act[k]
 
-        # (9) (옵션) joint 외력 잔차 모니터: should → 0
+        # (9) (옵션) joint 외력 잔차 모니터
         # resid = tau_apply.reshape(-1) - tau_joint_cmd
         # if np.linalg.norm(resid, ord=np.inf) > 1e-3:
-        #     pass  # 필요 시 디버그 출력
+        #     pass
 
     return (
         desired_ee, actual_ee, label_matrix, onset_vec, first_fault_t, int(t0),
