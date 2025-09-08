@@ -196,17 +196,24 @@ def main():
 
     # ---- 체크포인트 로드 ----
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    D_in = int(ckpt["input_dim"])
+
+    # state dict에서 시각화 모델에 없는 키 제거
+    state = dict(ckpt["model_state"])
+    state.pop("logit_scale", None)
+    state.pop("logit_shift", None)
+
+    D_in  = int(ckpt["input_dim"])
     M_out = int(ckpt["M"])
-    cfg = ckpt["cfg"]; hidden=int(cfg.get("hidden",128))
-    layers = int(cfg.get("layers",6))
-    ksize  = int(cfg.get("k",3))
-    dropout= float(cfg.get("dropout",0.1))
+    cfg   = ckpt["cfg"]; hidden=int(cfg.get("hidden",128))
+    layers= int(cfg.get("layers",6))
+    ksize = int(cfg.get("k",3))
+    dropout=float(cfg.get("dropout",0.1))
     mu = ckpt["train_mean"]; std = ckpt["train_std"]
 
     model = FaultDiagnosisTCN(D_in, M_out, hidden=hidden, layers=layers, k=ksize, dropout=dropout).to(device)
-    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.load_state_dict(state, strict=True)   # ✅ 불필요한 키 제거 후 로드 → 에러 해결
     model.eval()
+
 
     R = receptive_field(layers, ksize)
     lookback = args.override_lookback if args.override_lookback > 0 else R
@@ -553,9 +560,9 @@ if __name__ == "__main__":
 """
 디버깅용 터미널 입력
 python3 causal_tcn/visualize_stream_causal_tcn.py \
-  --ckpt TCN/TCN_link_3_RELonly_CAUSAL.pth \
+  --ckpt TCN/TCN_link_3_RELonly_CAUSAL_best.pth \
   --npz  data_storage/link_3/fault_dataset.npz \
-  --seq_idx 0 \
+  --seq_idx 100 \
   --threshold 0.5 \
   --kofn 3,5 \
   --data_hz 100 --speed 1.0 \
