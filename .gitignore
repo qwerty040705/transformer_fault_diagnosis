@@ -1,6 +1,6 @@
 .venv/
 data_storage/
-
+.venv312/
 # large datasets
 data_storage/
 *.npz

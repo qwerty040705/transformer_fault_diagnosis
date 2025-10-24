@@ -6,7 +6,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import multiprocessing as mp
-import sys, io, time, contextlib
+import sys, io, time, contextlib, re, glob
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -23,8 +23,32 @@ except Exception:
     from fault_injection import inject_faults
 from parameters import get_parameters
 from parameters_model import parameters_model
-from control.external_actuation import ExternalActuation      # ★ 외부 추력 분배기
-from control.centralized_controller import CentralizedController  # ★ 중앙집중 PID (q→τ)
+from control.external_actuation import ExternalActuation      # 추력 분배기
+from control.centralized_controller import CentralizedController  # PID (q→τ)
+
+# ---------------- Sharding config ----------------
+SHARD_SIZE = int(os.environ.get("SHARD_SIZE", "1000"))  # ✨ 1000개마다 저장
+USE_COMPRESSED = True
+
+def _to_f32(x):
+    x = np.asarray(x)
+    if np.issubdtype(x.dtype, np.floating):
+        return x.astype(np.float32, copy=False)
+    return x
+
+def _max_existing_shard_index(save_dir: str) -> int:
+    """
+    save_dir 안의 fault_dataset_shard_*.npz 중 최대 인덱스 반환. (없으면 0)
+    """
+    pat = os.path.join(save_dir, "fault_dataset_shard_*.npz")
+    max_idx = 0
+    for p in glob.glob(pat):
+        m = re.search(r"fault_dataset_shard_(\d{5})\.npz$", os.path.basename(p))
+        if m:
+            idx = int(m.group(1))
+            if idx > max_idx:
+                max_idx = idx
+    return max_idx
 
 # ---------------- Utils ----------------
 def _quiet_call(func, *args, **kwargs):
@@ -183,9 +207,10 @@ def vee(mat):
 def orientation_error(R_now, R_des):
     return 0.5 * vee(R_des.T @ R_now - R_now.T @ R_des)
 
-def clik_step(fk, q, T_des, dt, k_pos=2.0, k_rot=2.0, damp=1e-3):
+def clik_step(fk, q, T_des, dt, k_pos=2.0, k_rot=2.0, damp=1e-3, dq_clip=1.5):
     """
     Closed-loop IK: v = [ω; v] = [k_rot*e_R ; k_pos*e_x], dq = J^+ v
+    dq_clip: 관절속도 무한노름 상한 (rad/s). 초반 램프용으로 외부에서 주입.
     """
     q_flat = np.asarray(q).reshape(-1)          # (d,)
     T_now = fk.compute_end_effector_frame(q_flat)
@@ -201,7 +226,7 @@ def clik_step(fk, q, T_des, dt, k_pos=2.0, k_rot=2.0, damp=1e-3):
     pinv = J.T @ np.linalg.inv(JJt + damp*np.eye(6))  # d×6
 
     dq = pinv @ v6                                   # (d,1)
-    dq = clip_inf_norm(dq, 1.5)
+    dq = clip_inf_norm(dq, dq_clip)                  # ★ 외부 주입 상한
     q_next_col = q_flat.reshape(-1,1) + dt*dq        # (d,1)
     return q_next_col.reshape(-1), v6, e_r, e_x, J   # 반환은 1D (d,)
 
@@ -282,7 +307,7 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
     q0 = (np.random.rand(dof, 1) * 2 - 1) * 0.2 * np.pi
     T_des_series = generate_random_se3_series(
         fk_solver, q0, link_count, link_len, T=T,
-        max_pos_step=0.001, max_rot_step=0.001
+        max_pos_step=0.0005, max_rot_step=0.001
     )
 
     # ----- B_blkdiag (D와 순서 일치) -----
@@ -315,7 +340,7 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
 
     desired_ee = np.zeros((T, 4, 4))
     actual_ee  = np.zeros((T, 4, 4))
-    desired_ee[0] = fk_solver.compute_end_effector_frame(q_des[0][:,0])
+    desired_ee[0] = T_des_series[0]                 # ★ 레퍼런스 궤적 그대로 저장
     actual_ee[0]  = fk_solver.compute_end_effector_frame(q_act[0][:,0])
 
     desired_link_rel = np.zeros((T, link_count, 4, 4))
@@ -331,27 +356,48 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
         desired_link_rel[0, k] = lr0_des[k]; desired_link_cum[0, k] = lc0_des[k]
         actual_link_rel[0, k]  = lr0_act[k];  actual_link_cum[0, k]  = lc0_act[k]
 
+    # ----- 초기 과도 완화를 위한 램프/필터 파라미터 -----
+    N_ramp = max(1, int(1.5 / dt))   # 약 1.5초 동안 램프
+    dq_clip_min, dq_clip_max = 0.4, 1.5
+    k_pos_min,  k_pos_max  = 0.3, 2.0
+    k_rot_min,  k_rot_max  = 0.3, 2.0
+    alpha_min,  alpha_max  = 0.2, 1.0     # q_des 1차 필터 계수
+    lam_lp = None
+    beta_min,  beta_max  = 0.5, 0.1       # λ 저역통과 계수(초반 진하게→완화)
+
     # PD 미분항을 위한 이전 에러(선택적 로깅용)
     prev_e_r = np.zeros((3,1)); prev_e_x = np.zeros((3,1))
 
     # ----- 메인 루프 -----
     for t in range(1, T):
+        # 램프 스케일 0→1
+        s = min(1.0, t / N_ramp)
+        dq_clip_now = dq_clip_min*(1.0 - s) + dq_clip_max*s
+        k_pos_now   = k_pos_min *(1.0 - s) + k_pos_max*s
+        k_rot_now   = k_rot_min *(1.0 - s) + k_rot_max*s
+        alpha_now   = alpha_min *(1.0 - s) + alpha_max*s
+
         # (1) CLIK로 q_des 업데이트
         T_des = T_des_series[t]
         qd_next, v6, e_r, e_x, J_des = clik_step(
-            fk_solver, q_des[t-1][:,0], T_des, dt, k_pos=2.0, k_rot=2.0, damp=1e-4
+            fk_solver, q_des[t-1][:,0], T_des, dt,
+            k_pos=k_pos_now, k_rot=k_rot_now, damp=1e-4,
+            dq_clip=dq_clip_now
         )
-        q_des[t]  = qd_next.reshape(dof,1)
+
+        # q_des 초반 저역통과(1차 필터)
+        qd_col = qd_next.reshape(dof, 1)
+        q_des[t]  = alpha_now*qd_col + (1.0 - alpha_now)*q_des[t-1]
         dq_des[t] = ((q_des[t] - q_des[t-1]) / dt)
 
-        # (2) Desired FK & per-link 기록
-        desired_ee[t] = fk_solver.compute_end_effector_frame(q_des[t][:,0])
+        # (2) Desired 기록 (EE는 레퍼런스 그대로 저장)
+        desired_ee[t] = T_des_series[t]
         lr_des, _ = compute_link_relatives_pure(fk_solver, q_des[t][:,0])
         lc_des    = compute_link_cumulative_from_rel(lr_des)
         for k in range(link_count):
             desired_link_rel[t, k] = lr_des[k]; desired_link_cum[t, k] = lc_des[k]
 
-        # (2-1) EE-PD 렌치(선택적)
+        # (2-1) EE-PD 렌치(선택) – 필요시 로깅용
         T_now_des = desired_ee[t]
         Rd, pd = T_des[:3,:3], T_des[:3,3]
         Rn, pn = T_now_des[:3,:3], T_now_des[:3,3]
@@ -360,16 +406,14 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
         de_r = (e_r - prev_e_r) / dt
         de_x = (e_x - prev_e_x) / dt
         prev_e_r, prev_e_x = e_r.copy(), e_x.copy()
-        # F_des = ee_pd_wrench(e_r, e_x, de_r, de_x)  # 로그용이면 활성화
 
-        # ---------------- q→τ (PID) ----------------
+        # (3) q→τ (PID)
         cc.set_desired_state({"q": q_des[t], "dq": dq_des[t]})
-        tau_joint_cmd = cc.compute_tau(dt, q_act[t-1], dq_act[t-1])   # (d,1)
+        tau_joint_cmd = cc.compute_tau(dt, q_act[t-1], dq_act[t-1])
         tau_joint_cmd = clip_inf_norm(tau_joint_cmd, 5e4).reshape(-1)
 
-        # (3) 고장 전 bypass: Desired==Actual 보장(학습 안정화용)
+        # (4) 고장 전 bypass: desired==actual 동기화(학습 안정화)
         if bypass_Blambda and (t0_fault is not None) and (t < t0_fault):
-            # ==== FREEZE MODE: t == t₀-1 에서 미리 λ 계산해 둔다 ====
             if t == (t0_fault - 1):
                 lam_prev = ext_act.distribute_joint_linf(tau_joint_cmd)  # D^T B λ = τ
             q_act[t]  = q_des[t]
@@ -380,13 +424,11 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
             actual_link_cum[t] = desired_link_cum[t]
             continue
 
-        # ---------------- 분배 λ 계산/적용 (FREEZE MODE) ----------------
-        # 주의: t₀ 이후엔 LP 호출 금지. t₀ 직전 λ(lam_prev)를 고정 사용.
+        # (5) 분배 λ 계산/적용 (FREEZE MODE + 고장 전 저역통과)
         if (t0_fault is not None) and (t >= t0_fault):
+            # 고장 이후: FREEZE 모드
             if not fault_has_triggered:
-                # 첫 고장 시점 진입
                 if lam_prev is None:
-                    # 예외상황(바이패스 OFF이거나 t₀=1 등) 대비: 직전이 없으면 최소 한 번은 계산
                     lam_prev = ext_act.distribute_joint_linf(tau_joint_cmd)
                 lam_frozen = lam_prev.copy()
                 if faulty_cols.size > 0:
@@ -394,24 +436,24 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
                 fault_has_triggered = True
             lam_applied = lam_frozen
         else:
-            # 고장 전(바이패스 OFF인 경우만 도달): 평소처럼 LP
-            lam_cmd = ext_act.distribute_joint_linf(tau_joint_cmd)  # solves D^T B λ = τ
-            lam_prev = lam_cmd.copy()  # t₀-1에서 이 값이 얼려진다
-            lam_applied = lam_cmd
+            # 고장 전: λ 한 틱 저역통과(초반 진하게)
+            lam_cmd = ext_act.distribute_joint_linf(tau_joint_cmd)
+            beta_now = beta_min*(1.0 - s) + beta_max*s
+            lam_lp = lam_cmd if lam_lp is None else (1.0 - beta_now)*lam_cmd + beta_now*lam_lp
+            lam_prev = lam_lp.copy()
+            lam_applied = lam_lp
 
-        # (안전) 고장 이후에는 고장 컬럼이 항상 0이어야 함
         if fault_has_triggered and faulty_cols.size > 0:
-            # float 비교이므로 == 0.0 사용해도 무방(우리가 직접 0.0 대입)
             assert np.all(lam_applied[faulty_cols] == 0.0)
 
-        # (6) 실제 τ 재계산 (같은 실제 상태의 A = DᵀB)
-        D_now = np.asarray(robot.D, dtype=float)     # (6L×d)
+        # (6) 실제 τ 재계산
+        D_now = np.asarray(robot.D, dtype=float)
         D_now_s = ext_act._sanitize_mat(D_now, clip=ext_act.MAT_CLIP)
         B_blk_s = ext_act._sanitize_mat(B_blk,  clip=ext_act.MAT_CLIP)
         Aeq_now = D_now_s.T @ B_blk_s
         tau_apply = (Aeq_now @ lam_applied.reshape(-1,1)).reshape(dof,1)
 
-        # (7) 동역학 적분 (현재 실제 상태에서)
+        # (7) 동역학 적분
         nxt = robot.get_next_joint_states(dt, tau_apply)
         qn, dqn = nxt['q'], np.clip(nxt['dq'], -10.0, 10.0)
         if not (_is_finite(qn) and _is_finite(dqn)):
@@ -428,11 +470,6 @@ def generate_one_sample(link_count, T=1000, epsilon_scale=0.0, dt=0.01, seed=Non
             actual_link_rel[t, k]  = lr_act[k]
             actual_link_cum[t, k]  = lc_act[k]
 
-        # (9) (옵션) joint 외력 잔차 모니터
-        # resid = tau_apply.reshape(-1) - tau_joint_cmd
-        # if np.linalg.norm(resid, ord=np.inf) > 1e-3:
-        #     pass
-
     return (
         desired_ee, actual_ee, label_matrix, onset_vec, first_fault_t, int(t0),
         desired_link_rel, actual_link_rel, desired_link_cum, actual_link_cum,
@@ -446,21 +483,102 @@ def _worker(args):
         epsilon_scale=epsilon_scale, dt=dt, seed=seed, bypass_Blambda=bypass_Blambda
     )
 
-def generate_dataset_parallel(link_count, T, NUM_SAMPLES, dt, epsilon_scale, workers=None, bypass_Blambda=True):
+def generate_dataset_parallel(link_count, T, NUM_SAMPLES, dt, epsilon_scale, workers, save_dir, timestamps, bypass_Blambda=True):
     if workers is None or workers <= 0:
         workers = os.cpu_count() or 1
 
     args_list = [(link_count, T, epsilon_scale, dt, 1000+i, bypass_Blambda) for i in range(NUM_SAMPLES)]
 
-    desired_ee_list, actual_ee_list, label_list = [], [], []
-    onset_vec_list, first_fault_t_list, t0_list = [], [], []
-    d_link_rel_list, a_link_rel_list = [], []
-    d_link_cum_list, a_link_cum_list = [], []
-    dof_list, joint_counts_list = [], []
-
     print(f"Spawning {workers} worker(s)...", flush=True)
     done_cnt = 0; start_time = time.time()
     _progress_bar(done_cnt, NUM_SAMPLES, prefix="Generating samples", start_time=start_time)
+
+    # ── 샤드 버퍼 ─────────────────────────────────────────────────────
+    shard_idx = _max_existing_shard_index(save_dir)  # 기존 파일 이어붙이기
+    print(f"[shard] resume numbering from {shard_idx:05d} (existing max in {save_dir})")
+    paths = []
+
+    buf_desired_ee, buf_actual_ee = [], []
+    buf_label, buf_onset_vec, buf_first_fault_t, buf_t0 = [], [], [], []
+    buf_d_link_rel, buf_a_link_rel = [], []
+    buf_d_link_cum, buf_a_link_cum = [], []
+    buf_dof, buf_joint_counts = [], []
+
+    def _flush_shard():
+        nonlocal shard_idx, paths
+        if not buf_desired_ee:
+            return
+
+        desired_ee = _to_f32(np.asarray(buf_desired_ee))        # (S, T, 4, 4)
+        actual_ee  = _to_f32(np.asarray(buf_actual_ee))
+        label      = np.asarray(buf_label, dtype=np.int32)       # (S, T, M)
+        onset_vec  = np.asarray(buf_onset_vec, dtype=np.int32)   # (S, M)
+        first_fault_t_arr = np.asarray(buf_first_fault_t, dtype=np.int32)  # (S,)
+        t0_arr     = np.asarray(buf_t0, dtype=np.int32)          # (S,)
+
+        d_link_rel = _to_f32(np.asarray(buf_d_link_rel))         # (S, T, L, 4, 4)
+        a_link_rel = _to_f32(np.asarray(buf_a_link_rel))
+        d_link_cum = _to_f32(np.asarray(buf_d_link_cum))
+        a_link_cum = _to_f32(np.asarray(buf_a_link_cum))
+
+        dof_arr         = np.asarray(buf_dof, dtype=np.int32)                # (S,)
+        joint_counts_arr= np.asarray(buf_joint_counts, dtype=np.int32)       # (S, L)
+
+        # 다음 번호 배정 + 충돌 시 건너뛰기
+        shard_idx += 1
+        fname = f"fault_dataset_shard_{shard_idx:05d}.npz"
+        path  = os.path.join(save_dir, fname)
+        while os.path.exists(path):
+            shard_idx += 1
+            fname = f"fault_dataset_shard_{shard_idx:05d}.npz"
+            path  = os.path.join(save_dir, fname)
+
+        if USE_COMPRESSED:
+            np.savez_compressed(
+                path,
+                desired_link_rel=d_link_rel,
+                actual_link_rel=a_link_rel,
+                desired_link_cum=d_link_cum,
+                actual_link_cum=a_link_cum,
+                label=label,
+                onset_idx=onset_vec,
+                first_fault_t=first_fault_t_arr,
+                t0=t0_arr,
+                timestamps=timestamps,
+                dt=dt,
+                link_count=link_count,
+                dof=dof_arr,
+                joint_counts=joint_counts_arr,
+                desired_ee=desired_ee,
+                actual_ee=actual_ee
+            )
+        else:
+            np.savez(
+                path,
+                desired_link_rel=d_link_rel,
+                actual_link_rel=a_link_rel,
+                desired_link_cum=d_link_cum,
+                actual_link_cum=a_link_cum,
+                label=label,
+                onset_idx=onset_vec,
+                first_fault_t=first_fault_t_arr,
+                t0=t0_arr,
+                timestamps=timestamps,
+                dt=dt,
+                link_count=link_count,
+                dof=dof_arr,
+                joint_counts=joint_counts_arr,
+                desired_ee=desired_ee,
+                actual_ee=actual_ee
+            )
+        print(f"\n[shard] saved: {path}")
+        paths.append(path)
+
+        # 버퍼 초기화
+        buf_desired_ee.clear(); buf_actual_ee.clear()
+        buf_label.clear(); buf_onset_vec.clear(); buf_first_fault_t.clear(); buf_t0.clear()
+        buf_d_link_rel.clear(); buf_a_link_rel.clear(); buf_d_link_cum.clear(); buf_a_link_cum.clear()
+        buf_dof.clear(); buf_joint_counts.clear()
 
     ctx = mp.get_context("spawn")
     with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
@@ -470,65 +588,39 @@ def generate_dataset_parallel(link_count, T, NUM_SAMPLES, dt, epsilon_scale, wor
                 (d_ee, a_ee, label_mat, onset_vec, first_fault_t, t0,
                  d_lr, a_lr, d_lc, a_lc, dof, joint_counts) = fut.result()
 
-                desired_ee_list.append(d_ee)
-                actual_ee_list.append(a_ee)
-                label_list.append(label_mat)
-                onset_vec_list.append(onset_vec)
-                first_fault_t_list.append(first_fault_t)
-                t0_list.append(t0)
-                d_link_rel_list.append(d_lr)
-                a_link_rel_list.append(a_lr)
-                d_link_cum_list.append(d_lc)
-                a_link_cum_list.append(a_lc)
-                dof_list.append(dof)
-                joint_counts_list.append(joint_counts)
+                # 버퍼에 push
+                buf_desired_ee.append(_to_f32(d_ee))
+                buf_actual_ee.append(_to_f32(a_ee))
+                buf_label.append(label_mat.astype(np.int32, copy=False))
+                buf_onset_vec.append(onset_vec.astype(np.int32, copy=False))
+                buf_first_fault_t.append(int(first_fault_t))
+                buf_t0.append(int(t0))
+
+                # (T, L, 4,4) 형태 유지 → (S, T, L, 4,4)
+                buf_d_link_rel.append(_to_f32(d_lr))
+                buf_a_link_rel.append(_to_f32(a_lr))
+                buf_d_link_cum.append(_to_f32(d_lc))
+                buf_a_link_cum.append(_to_f32(a_lc))
+
+                buf_dof.append(int(dof))
+                buf_joint_counts.append(np.asarray(joint_counts, dtype=np.int32))
 
                 done_cnt += 1
                 _progress_bar(done_cnt, NUM_SAMPLES, prefix="Generating samples", start_time=start_time)
 
+                # ✨ 샤드 플러시
+                if len(buf_desired_ee) >= SHARD_SIZE:
+                    _flush_shard()
+
         except KeyboardInterrupt:
             ex.shutdown(cancel_futures=True)
-            print("\nInterrupted. Returning partial results...")
-            if len(desired_ee_list) == 0:
-                return (
-                    np.empty((0,)), np.empty((0,)), np.empty((0,)),
-                    np.empty((0,)), np.empty((0,), dtype=np.int32), np.empty((0,), dtype=np.int32),
-                    np.empty((0,)), np.empty((0,)), np.empty((0,)), np.empty((0,)),
-                    0, np.empty((0,), dtype=np.int32),
-                    True
-                )
+            print("\nInterrupted! Flushing remaining buffer...")
+            _flush_shard()
+            return {"partial": True, "total": done_cnt, "paths": paths}
 
-            desired_ee = np.asarray(desired_ee_list)
-            actual_ee  = np.asarray(actual_ee_list)
-            label      = np.asarray(label_list)
-            onset_vec_arr = np.asarray(onset_vec_list)
-            first_fault_t_arr = np.asarray(first_fault_t_list, dtype=np.int32)
-            t0_arr     = np.asarray(t0_list, dtype=np.int32)
-            d_link_rel = np.asarray(d_link_rel_list)
-            a_link_rel = np.asarray(a_link_rel_list)
-            d_link_cum = np.asarray(d_link_cum_list)
-            a_link_cum = np.asarray(a_link_cum_list)
-            dof_out    = int(dof_list[0]) if dof_list else 0
-            joint_counts_arr = np.asarray(joint_counts_list)
-            return (desired_ee, actual_ee, label, onset_vec_arr, first_fault_t_arr, t0_arr,
-                    d_link_rel, a_link_rel, d_link_cum, a_link_cum, dof_out, joint_counts_arr,
-                    True)
-
-    desired_ee = np.asarray(desired_ee_list)
-    actual_ee  = np.asarray(actual_ee_list)
-    label      = np.asarray(label_list)
-    onset_vec_arr = np.asarray(onset_vec_list)
-    first_fault_t_arr = np.asarray(first_fault_t_list, dtype=np.int32)
-    t0_arr     = np.asarray(t0_list, dtype=np.int32)
-    d_link_rel = np.asarray(d_link_rel_list)
-    a_link_rel = np.asarray(a_link_rel_list)
-    d_link_cum = np.asarray(d_link_cum_list)
-    a_link_cum = np.asarray(a_link_cum_list)
-    dof_out    = int(dof_list[0]) if dof_list else 0
-    joint_counts_arr = np.asarray(joint_counts_list)
-    return (desired_ee, actual_ee, label, onset_vec_arr, first_fault_t_arr, t0_arr,
-            d_link_rel, a_link_rel, d_link_cum, a_link_cum, dof_out, joint_counts_arr,
-            False)
+    # 마지막 잔여 버퍼 flush
+    _flush_shard()
+    return {"partial": False, "total": done_cnt, "paths": paths}
 
 # ---------------- Main ----------------
 if __name__ == '__main__':
@@ -563,33 +655,13 @@ if __name__ == '__main__':
     dt = 0.01
     timestamps = np.arange(T) * dt
 
-    (desired_ee, actual_ee, label, onset_vec_arr, first_fault_t_arr, t0_arr,
-     d_link_rel, a_link_rel, d_link_cum, a_link_cum, dof, joint_counts_arr,
-     is_partial) = generate_dataset_parallel(
-        link_count, T, NUM_SAMPLES, dt, epsilon_scale, workers, bypass_Blambda=bypass_Blambda
+    result = generate_dataset_parallel(
+        link_count, T, NUM_SAMPLES, dt, epsilon_scale, workers,
+        save_dir=save_dir, timestamps=timestamps, bypass_Blambda=bypass_Blambda
     )
 
-    if desired_ee.size == 0:
-        print("No samples were generated. Nothing to save.")
-    else:
-        fname = "fault_dataset_partial.npz" if is_partial else "fault_dataset.npz"
-        save_path = os.path.join(save_dir, fname)
-        np.savez(
-            save_path,
-            desired_link_rel=d_link_rel,
-            actual_link_rel=a_link_rel,
-            desired_link_cum=d_link_cum,
-            actual_link_cum=a_link_cum,
-            label=label,
-            onset_idx=onset_vec_arr,
-            first_fault_t=first_fault_t_arr,
-            t0=t0_arr,
-            timestamps=timestamps,
-            dt=dt,
-            link_count=link_count,
-            dof=dof,
-            joint_counts=joint_counts_arr,
-            desired_ee=desired_ee,
-            actual_ee=actual_ee
-        )
-        print(f"\nDataset saved successfully to {save_path}")
+    print(f"\nDone. total_samples={result['total']}, partial={result['partial']}")
+    print("Shard files:")
+    for p in result["paths"]:
+        print(" -", p)
+    print(f"\nSHARD_SIZE={SHARD_SIZE} | saved in: {save_dir}")
