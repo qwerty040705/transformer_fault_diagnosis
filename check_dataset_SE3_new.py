@@ -141,7 +141,7 @@ link_count = int(input("How many links do you want to check?: ").strip())
 data_dir = os.path.join("data_storage", f"link_{link_count}")
 
 # 확인하고 싶은 샘플 인덱스 (전역 인덱스; 샤드 전체를 0..S_total-1로 본 번호)
-sample_idx = 0  
+sample_idx = 1 
 
 # 데이터 로드 (가능하면 해당 샤드 1개만 로드)
 data, info = load_single_or_sharded(link_count, target_sample_idx=sample_idx)
