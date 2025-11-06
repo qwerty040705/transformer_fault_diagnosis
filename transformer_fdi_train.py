@@ -5,6 +5,7 @@ Transformer-based LASDRA fault detector (accuracy-first, no topology graph) with
 - OOM-safe: gradient checkpointing, SDPA attention (new API w/ fallback-to-noop), AMP eval/inference_mode
 - Per-epoch metrics: Precision/Recall/F1 (macro: all & fault-only), Micro-F1
 - Best & Last checkpoint saving
+- Warmup LR schedulers (Noam or Cosine+LinearWarmup), stepped per-optimizer-update (accum-steps aware)
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from __future__ import annotations
 import argparse
 import glob
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Dict
@@ -417,7 +417,7 @@ class TemporalLinkTransformer(nn.Module):
         self.motor_healthy_bias = nn.Parameter(torch.tensor(0.0))
 
     def _sdp_ctx(self):
-        # Prefer new API (PyTorch >= 2.5). If unavailable, do nothing (avoid deprecated warnings).
+        # Prefer new API (PyTorch >= 2.5). If unavailable, no-op (avoid deprecated warnings).
         if not (self.use_sdp and torch.cuda.is_available()):
             return nullcontext()
         try:
@@ -490,7 +490,7 @@ def compute_class_weights(labels: np.ndarray, num_classes: int) -> torch.Tensor:
 def hard_mask_motor_logits(motor_logits: torch.Tensor, link_idx: torch.Tensor, L: int) -> torch.Tensor:
     """
     Eval-time structural mask: keep only motors from predicted link (and healthy=0).
-    (FP16/AMP 안전) dtype별 최소 유한값으로 마스킹하여 오버플로우 방지.
+    AMP/FP16 안전: dtype의 최소 유한값으로 마스킹 (예: float16은 -65504).
     """
     B = motor_logits.size(0)
     device = motor_logits.device
@@ -502,31 +502,22 @@ def hard_mask_motor_logits(motor_logits: torch.Tensor, link_idx: torch.Tensor, L
     allowed = (glink.unsqueeze(0) == link_idx.unsqueeze(1)) | (idx.unsqueeze(0) == 0)
     allowed = allowed.to(torch.bool)
 
-    # dtype-safe large negative for masking (e.g., -65504 for float16)
     neg_large = torch.tensor(torch.finfo(motor_logits.dtype).min, dtype=motor_logits.dtype, device=device)
     return torch.where(allowed, motor_logits, neg_large)
 
 def consistency_loss(link_logits: torch.Tensor, motor_logits: torch.Tensor, L: int) -> torch.Tensor:
-    """
-    KL(link_from_motor || link_head) + healthy prob L1.
-    FP16/FP32 모두 안전.
-    """
+    """KL(link_from_motor || link_head) + healthy prob L1. AMP/FP16/FP32 안전."""
     if L == 0:
         return motor_logits.new_zeros(())
     B = motor_logits.size(0)
-    # motors -> links (log-sum-exp over 8 motors per link)
     link_from_motor = motor_logits.new_empty(B, L)
     for i in range(L):
         s = 1 + i * MOTORS_PER_LINK
         e = s + MOTORS_PER_LINK
         link_from_motor[:, i] = torch.logsumexp(motor_logits[:, s:e], dim=1)
-
-    # KL(q||p) with q = Softmax(link_from_motor), p = Softmax(link_logits[:,1:])
     log_q = F.log_softmax(link_from_motor, dim=1)
     p     = F.softmax(link_logits[:, 1:], dim=1)
     kl = F.kl_div(log_q, p, reduction="batchmean")
-
-    # healthy prob alignment (class 0)
     p0 = F.softmax(link_logits, dim=1)[:, 0]
     m0 = F.softmax(motor_logits, dim=1)[:, 0]
     healthy_l1 = F.l1_loss(m0, p0)
@@ -555,16 +546,14 @@ def _update_counts(counts: Dict[str, np.ndarray], y_pred: torch.Tensor, y_true: 
 def _compute_prf(counts: Dict[str, np.ndarray], exclude_zero: bool = False) -> Dict[str, float]:
     tp, fp, fn = counts["tp"].astype(np.float64), counts["fp"].astype(np.float64), counts["fn"].astype(np.float64)
     C = tp.shape[0]
-    class_mask = (tp + fn) > 0  # only classes with support
+    class_mask = (tp + fn) > 0
     if exclude_zero and C > 0:
         class_mask[0] = False
-
     with np.errstate(divide='ignore', invalid='ignore'):
         prec_c = np.divide(tp, tp + fp, out=np.zeros_like(tp), where=(tp + fp) > 0)
         rec_c  = np.divide(tp, tp + fn, out=np.zeros_like(tp), where=(tp + fn) > 0)
         f1_c   = np.divide(2 * prec_c * rec_c, (prec_c + rec_c),
                            out=np.zeros_like(prec_c), where=(prec_c + rec_c) > 0)
-
     sel = class_mask
     sel_count = max(int(sel.sum()), 1)
     macro_p = float(prec_c[sel].sum() / sel_count)
@@ -575,11 +564,60 @@ def _compute_prf(counts: Dict[str, np.ndarray], exclude_zero: bool = False) -> D
     micro_p = float(TP / max(TP + FP, 1e-9))
     micro_r = float(TP / max(TP + FN, 1e-9))
     micro_f1 = float(0.0 if (micro_p + micro_r) == 0 else (2 * micro_p * micro_r) / (micro_p + micro_r))
+    return {"macro_p": macro_p, "macro_r": macro_r, "macro_f1": macro_f1, "micro_f1": micro_f1}
 
-    return {
-        "macro_p": macro_p, "macro_r": macro_r, "macro_f1": macro_f1,
-        "micro_f1": micro_f1
-    }
+# ============================ LR scheduler builders ============================
+
+def build_noam_lambda(d_model: int, warmup_steps: int):
+    """
+    Noam schedule normalized so that factor == 1 at step = warmup_steps.
+    Then actual LR at warmup peak equals optimizer's base lr (args.lr).
+    """
+    d_scale = d_model ** (-0.5)
+    peak = d_scale * (warmup_steps ** (-0.5))  # value at s = warmup
+    peak = max(peak, 1e-12)
+
+    def fn(step: int):
+        s = max(step, 1)  # avoid zero
+        return (d_scale * min(s ** (-0.5), s * (warmup_steps ** (-1.5)))) / peak
+    return fn
+
+def build_scheduler(optimizer: torch.optim.Optimizer,
+                    args: argparse.Namespace,
+                    updates_per_epoch: int,
+                    total_epochs: int):
+    """
+    Returns (scheduler, total_updates). Scheduler must be stepped after each optimizer.step().
+    """
+    total_updates = max(updates_per_epoch * total_epochs, 1)
+    warmup = int(args.warmup_steps)
+
+    if args.scheduler == "noam":
+        lam = build_noam_lambda(args.d_model, max(warmup, 1))
+        sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lam)
+        info = f"[sched] Noam warmup_steps={warmup} (peak lr={args.lr} at step={warmup})"
+    elif args.scheduler == "cosine_warmup":
+        from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+        wu = max(warmup, 0)
+        remain = max(total_updates - wu, 1)
+        sched1 = LinearLR(optimizer,
+                          start_factor=args.warmup_start_lr_factor,
+                          end_factor=1.0,
+                          total_iters=wu) if wu > 0 else None
+        sched2 = CosineAnnealingLR(optimizer, T_max=remain, eta_min=args.min_lr)
+        if sched1 is not None:
+            sched = SequentialLR(optimizer, schedulers=[sched1, sched2], milestones=[wu])
+            info = (f"[sched] LinearWarmup→Cosine: warmup_steps={wu}, total_updates={total_updates}, "
+                    f"eta_min={args.min_lr}, start_factor={args.warmup_start_lr_factor}")
+        else:
+            sched = sched2
+            info = (f"[sched] Cosine(no warmup): total_updates={total_updates}, eta_min={args.min_lr}")
+    else:  # "cosine"
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_updates, eta_min=args.min_lr)
+        info = f"[sched] Cosine: total_updates={total_updates}, eta_min={args.min_lr}"
+
+    print(info, flush=True)
+    return sched, total_updates
 
 # ============================ Train loop ============================
 
@@ -597,6 +635,7 @@ def run_epoch(
     consistency_weight: float,
     accum_steps: int = 1,
     compute_metrics: bool = True,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
 ) -> Tuple[float, float, float, Dict[str, float]]:
     training = optimizer is not None
 
@@ -648,6 +687,8 @@ def run_epoch(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    if scheduler is not None:
+                        scheduler.step()
 
             total_loss += float(loss.item()) * bsz
             link_pred = link_logits.argmax(dim=1)
@@ -688,7 +729,7 @@ def run_epoch(
 # ============================ CLI & main ============================
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Transformer FDI Trainer (accuracy-first, OOM-safe)")
+    p = argparse.ArgumentParser(description="Transformer FDI Trainer (accuracy-first, OOM-safe, with warmup)")
     p.add_argument("--data-root", type=str, default="data_storage/link_3")
     p.add_argument("--max-shards", type=int, default=0)
     p.add_argument("--baseline-window", type=int, default=120)
@@ -711,7 +752,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--val-batch-size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--lr", type=float, default=2e-4, help="Base LR (also peak LR at warmup end for Noam & cosine_warmup).")
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--accum-steps", type=int, default=1, help="Gradient accumulation steps.")
     p.add_argument("--motor-weight", type=float, default=1.0)
@@ -743,6 +784,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--prefetch-factor", type=int, default=2)
     p.add_argument("--persistent-workers", action="store_true", default=True)
+
+    # LR scheduler / warmup
+    p.add_argument("--scheduler", type=str, choices=["noam", "cosine_warmup", "cosine"], default="noam",
+                   help="Warmup/schedule type. 'noam' follows the Transformer paper.")
+    p.add_argument("--warmup-steps", type=int, default=4000, help="Warmup steps (optimizer updates).")
+    p.add_argument("--warmup-start-lr-factor", type=float, default=0.01,
+                   help="For cosine_warmup: starting LR factor relative to base LR.")
+    p.add_argument("--min-lr", type=float, default=0.0, help="Eta_min for cosine schedules.")
     return p.parse_args()
 
 def _derive_save_paths(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
@@ -864,7 +913,13 @@ def main() -> None:
     motor_loss_fn = nn.CrossEntropyLoss(weight=motor_w, label_smoothing=args.label_smoothing_motor)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # ---- Build scheduler (per update) ----
+    num_batches = len(train_loader)
+    updates_per_epoch = math.ceil(num_batches / max(args.accum-steps if hasattr(args, 'accum-steps') else args.accum_steps, 1))  # safeguard
+    # The above hasattr guard supports hyphenated/underscore mismatch; but parser uses 'accum_steps'.
+    updates_per_epoch = math.ceil(num_batches / max(args.accum_steps, 1))
+    scheduler, total_updates = build_scheduler(optimizer, args, updates_per_epoch, args.epochs)
 
     best_metric = -1.0
     best_epoch = 0
@@ -876,14 +931,14 @@ def main() -> None:
             args.motor_weight, optimizer, device, amp=args.amp, link_count=L,
             hard_mask_eval=False, consistency_weight=args.consistency_weight,
             accum_steps=args.accum_steps, compute_metrics=args.metrics_train,
+            scheduler=scheduler,
         )
         val_loss, val_link_acc, val_motor_acc, va_m = run_epoch(
             model, val_loader, link_loss_fn, motor_loss_fn,
             args.motor_weight, optimizer=None, device=device, amp=args.eval_amp, link_count=L,
             hard_mask_eval=args.hard_mask_eval, consistency_weight=args.consistency_weight,
-            accum_steps=1, compute_metrics=True,
+            accum_steps=1, compute_metrics=True, scheduler=None,
         )
-        scheduler.step()
 
         # Choose best by fault-only link macro F1
         current_score = va_m["link_fault_macro_f1"]
@@ -910,6 +965,7 @@ def main() -> None:
                 )
 
         def fmt(m, k): return f"{m[k]*100:5.2f}%"
+        curr_lr = optimizer.param_groups[0]["lr"]
         tr_line = (f"train: loss={tr_loss:.4f} | acc(link/motor)={tr_link_acc*100:5.2f}%/{tr_motor_acc*100:5.2f}%")
         if args.metrics_train:
             tr_line += (f" | L-mF1(all/fault)={fmt(tr_m,'link_macro_f1')}/{fmt(tr_m,'link_fault_macro_f1')}"
@@ -919,7 +975,7 @@ def main() -> None:
                    f" | L-fault-mF1={fmt(va_m,'link_fault_macro_f1')}"
                    f" | M-mF1={fmt(va_m,'motor_macro_f1')} | M-fault-mF1={fmt(va_m,'motor_fault_macro_f1')}"
                    f" | best L-fault-mF1={best_metric*100:5.2f}% (ep{best_epoch})")
-        print(f"Epoch {ep:02d}/{args.epochs} | {tr_line}\n{va_line}")
+        print(f"Epoch {ep:02d}/{args.epochs} | {tr_line}\n{va_line} | lr={curr_lr:.6g}")
 
     # Save last
     if last_path:
@@ -960,5 +1016,10 @@ python3 transformer_fdi_train.py \
   --num-workers 12 --prefetch-factor 6 --persistent-workers \
   --amp --eval-amp \
   --grad-checkpoint \
+  --scheduler cosine_warmup \
+  --warmup-steps 6000 \
+  --warmup-start-lr-factor 0.01 \
+  --min-lr 0.0 \
+  --lr 2e-4 \
   --save trans_fdi_big.pt
 """
