@@ -1,11 +1,15 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# transformer_fdi_train.py
 """
-Transformer-based LASDRA fault detector (accuracy-first, no topology graph) with:
+Transformer-based LASDRA fault detector with:
 - OOM-safe: gradient checkpointing, SDPA attention (new API w/ fallback-to-noop), AMP eval/inference_mode
 - Per-epoch metrics: Precision/Recall/F1 (macro: all & fault-only), Micro-F1
-- Best & Last checkpoint saving
+- Best & Last checkpoint saving (EMA weights used for eval/saving if enabled)
 - Warmup LR schedulers (Noam or Cosine+LinearWarmup), stepped per-optimizer-update (accum-steps aware)
+- NEW: Energy tie-break for multi-fault frames, Attentive time pooling, simple time/feature masking aug,
+       class-balanced sampling (optional), EMA weights for validation/saving
+- NEW (2025-11-07): Flexible NPZ loader that tolerates varying key names across shards and ALWAYS uses all shards.
+- NEW (patch): epoch/sample caps (--samples-per-epoch, --max-windows-per-seq), --no-pin-memory,
+               vectorized consistency loss, proper per-step EMA update.
 """
 
 from __future__ import annotations
@@ -21,8 +25,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from contextlib import nullcontext
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from contextlib import contextmanager, nullcontext
 
 # ============================ Constants & small utils ============================
 
@@ -93,26 +97,35 @@ def compute_motor_directions(rotations: np.ndarray, motor_layout: np.ndarray) ->
 
 # ------------------------- Labels collapsing -------------------------
 
-def build_link_targets(label_matrix: np.ndarray) -> np.ndarray:
+def build_link_targets_energy(label_matrix: np.ndarray,
+                              energy_per_link: np.ndarray) -> np.ndarray:
     """
     label_matrix: (S,T, 8*L) with 1=healthy, 0=faulty.
-    Collapse to per-(S,T) categorical link index: 0=healthy, 1..L faulty link id.
+    energy_per_link: (S,T,L) scalar energy per link, used as tie-breaker.
+
+    Collapse to per-(S,T) categorical link index:
+      0=healthy, 1..L faulty link id (if multiple links faulty → pick the one with max energy).
     """
     S, T, M = label_matrix.shape
     if M % MOTORS_PER_LINK != 0:
         raise ValueError(f"Label width {M} not divisible by {MOTORS_PER_LINK}.")
     L = M // MOTORS_PER_LINK
     reshaped = label_matrix.reshape(S, T, L, MOTORS_PER_LINK)
-    fault_flags = reshaped.min(axis=-1) < 1  # (S,T,L)
-    targets = fault_flags.argmax(axis=-1) + 1
-    healthy = ~fault_flags.any(axis=-1)
-    targets[healthy] = 0
-    return targets.astype(np.int64, copy=False)
+    fault_flags = reshaped.min(axis=-1) < 1  # (S,T,L) True if any motor faulty
+
+    targets = np.zeros((S, T), dtype=np.int64)
+    any_fault = fault_flags.any(axis=-1)     # (S,T)
+    # Choose link with max energy among faulty links
+    neg_inf = np.full_like(energy_per_link, -1e10, dtype=np.float32)
+    masked_energy = np.where(fault_flags, energy_per_link, neg_inf)
+    picked = masked_energy.argmax(axis=-1) + 1  # 1..L
+    targets[any_fault] = picked[any_fault]
+    return targets
 
 def build_motor_targets(label_matrix: np.ndarray) -> np.ndarray:
     """
     label_matrix: (S,T, 8*L) with 1=healthy, 0=faulty.
-    Collapse to global motor categorical: 0=healthy, 1..(8L) faulty motor id.
+    Collapse to global motor categorical: 0=healthy, 1..(8L) faulty motor id (first faulty).
     """
     S, T, M = label_matrix.shape
     faults = label_matrix < 1
@@ -140,12 +153,13 @@ def build_features(
     baseline_window: int = 120,
     include_motor_features: bool = True,
     component_threshold_deg: float = 18.0,
+    use_energy_tiebreak: bool = True,
 ) -> FeaturePack:
     S, T, L, _, _ = desired_cum.shape
 
     # Residuals & energy
     omega_resid, pos_err = compute_se3_residual(desired_cum, actual_cum)  # (S,T,L,3)
-    energy = (omega_resid**2 + pos_err**2).sum(axis=-1, keepdims=True).astype(np.float32)
+    energy = (omega_resid**2 + pos_err**2).sum(axis=-1, keepdims=True).astype(np.float32)  # (S,T,L,1)
 
     # Absolute rotation/axis & temporal angular velocity
     R_act = actual_cum[..., :3, :3]
@@ -189,7 +203,19 @@ def build_features(
         node_parts.append(per_motor_flat)
 
     node_features = np.concatenate(node_parts, axis=-1)  # (S,T,L,F)
-    link_labels  = build_link_targets(labels)
+
+    # Labels (energy-based tie-break for multi-fault)
+    if use_energy_tiebreak:
+        link_labels  = build_link_targets_energy(labels, energy.squeeze(-1))
+    else:
+        # fallback: first-fault link
+        reshaped = labels.reshape(S, T, L, MOTORS_PER_LINK)
+        fault_flags = reshaped.min(axis=-1) < 1  # (S,T,L)
+        targets = fault_flags.argmax(axis=-1) + 1
+        healthy = ~fault_flags.any(axis=-1)
+        targets[healthy] = 0
+        link_labels = targets.astype(np.int64, copy=False)
+
     motor_labels = build_motor_targets(labels)
 
     return FeaturePack(
@@ -200,17 +226,156 @@ def build_features(
         link_count=node_features.shape[2],
     )
 
-# ============================ Shard discovery & loader ============================
+# ============================ Flexible shard discovery & loader ============================
 
 def discover_shards(root: str) -> List[Path]:
-    pattern = str(Path(root) / "fault_dataset_shard_*.npz")
-    return [Path(p) for p in sorted(glob.glob(pattern))]
+    """
+    Find ALL .npz shards in the directory. We support both the the canonical
+    'fault_dataset_shard_*.npz' pattern and any '*.npz' files for robustness.
+    """
+    root_p = Path(root)
+    cand1 = sorted(glob.glob(str(root_p / "fault_dataset_shard_*.npz")))
+    cand2 = sorted(glob.glob(str(root_p / "*.npz")))
+    all_paths = []
+    seen = set()
+    for p in cand1 + cand2:
+        if p not in seen:
+            seen.add(p)
+            all_paths.append(p)
+    return [Path(p) for p in all_paths]
+
+# ---- Robust NPZ key resolution -------------------------------------------------
+
+_DESIRED_ALIASES = [
+    "desired_link_cum", "desired_cum", "T_desired", "T_ref", "ref_link_cum",
+    "ref_cum", "desired_world", "desired_base", "commanded_link_cum",
+    "goal_link_cum", "goal_cum", "target_cum", "Tref", "T_ref_world"
+]
+_ACTUAL_ALIASES = [
+    "actual_link_cum", "actual_cum", "T_actual", "T_meas", "measured_link_cum",
+    "obs_link_cum", "meas_cum", "actual_world", "actual_base", "observed_cum",
+    "measured_cum"
+]
+_LABEL_ALIASES = [
+    "label", "labels", "fault_label", "fault_labels", "y", "y_labels",
+    "link_motor_label", "link_motor_labels"
+]
+
+_POS_TOKENS_DES = ("des", "ref", "cmd", "goal", "tref", "target")
+_POS_TOKENS_ACT = ("act", "meas", "obs")
+
+def _has_shape_44(a: np.ndarray) -> bool:
+    return a.ndim >= 5 and a.shape[-2:] == (4, 4)
+
+def _first_key(keys: List[str], candidates: Sequence[str]) -> Optional[str]:
+    for k in candidates:
+        if k in keys:
+            return k
+    return None
+
+def _find_by_tokens(keys: List[str], pos_tokens: Tuple[str, ...], exclude: Tuple[str, ...] = ()) -> Optional[str]:
+    low = {k: k.lower() for k in keys}
+    for k in keys:
+        name = low[k]
+        if any(t in name for t in pos_tokens) and not any(t in name for t in exclude):
+            return k
+    return None
+
+def _auto_pick_se3_pair(data: np.lib.npyio.NpzFile, keys: List[str]) -> Tuple[str, str]:
+    """Pick two (S,T,L,4,4) keys; prefer ones with tokens indicating desired/actual."""
+    se3_keys = [k for k in keys if _has_shape_44(data[k])]
+    if len(se3_keys) < 2:
+        raise KeyError(
+            f"Need at least 2 SE(3) arrays shaped (S,T,L,4,4). Found {len(se3_keys)}: {se3_keys}"
+        )
+    d_key = _find_by_tokens(se3_keys, _POS_TOKENS_DES)
+    a_key = _find_by_tokens(se3_keys, _POS_TOKENS_ACT)
+    if d_key and a_key and d_key != a_key and data[d_key].shape == data[a_key].shape:
+        return d_key, a_key
+    se3_keys_sorted = sorted(se3_keys)
+    for i in range(len(se3_keys_sorted)):
+        for j in range(i+1, len(se3_keys_sorted)):
+            if data[se3_keys_sorted[i]].shape == data[se3_keys_sorted[j]].shape:
+                return se3_keys_sorted[i], se3_keys_sorted[j]
+    raise KeyError("Could not find two SE(3) arrays with matching shapes among keys: " + str(se3_keys))
+
+def _expand_link_label_to_motor(label_link: np.ndarray, L: int) -> np.ndarray:
+    """
+    If labels are (S,T,L) with 1=healthy, 0=faulty per link,
+    expand to (S,T,8*L) by repeating each link's label across 8 motors.
+    """
+    S, T, Lx = label_link.shape
+    if Lx != L:
+        raise ValueError(f"Link label last-dim {Lx} does not match link count {L}.")
+    expanded = np.repeat(label_link[..., None], MOTORS_PER_LINK, axis=-1).reshape(S, T, L * MOTORS_PER_LINK)
+    return expanded.astype(np.float32, copy=False)
+
+def load_shard_flex(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, str]]:
+    """
+    Load one shard robustly, returning (desired_cum, actual_cum, labels_motor),
+    along with a dict of the resolved keys for logging.
+    """
+    with np.load(path) as data:
+        keys = list(data.keys())
+
+        d_key = _first_key(keys, _DESIRED_ALIASES)
+        a_key = _first_key(keys, _ACTUAL_ALIASES)
+
+        if d_key is None or a_key is None:
+            try:
+                auto_d, auto_a = _auto_pick_se3_pair(data, keys)
+                d_key = d_key or auto_d
+                a_key = a_key or auto_a
+            except Exception as e:
+                raise KeyError(
+                    f"[{path.name}] Cannot resolve desired/actual SE(3) arrays.\n"
+                    f"Available keys: {keys}\nReason: {e}"
+                ) from e
+
+        desired = data[d_key]
+        actual  = data[a_key]
+        if not (_has_shape_44(desired) and _has_shape_44(actual)):
+            raise ValueError(
+                f"[{path.name}] Resolved keys do not have shape (...,4,4): "
+                f"{d_key}:{desired.shape}, {a_key}:{actual.shape}"
+            )
+        if desired.shape != actual.shape:
+            raise ValueError(
+                f"[{path.name}] desired/actual shapes differ: {desired.shape} vs {actual.shape}"
+            )
+        S, T, L = desired.shape[:3]
+
+        lbl_key = _first_key(keys, _LABEL_ALIASES)
+        labels_motor = None
+        if lbl_key is not None:
+            lbl = data[lbl_key]
+            if lbl.ndim != 3 or lbl.shape[0] != S or lbl.shape[1] != T:
+                raise ValueError(
+                    f"[{path.name}] Label shape {lbl.shape} incompatible with SE(3) shape {(S,T,L)} for key '{lbl_key}'."
+                )
+            if lbl.shape[2] == L * MOTORS_PER_LINK:
+                labels_motor = lbl.astype(np.float32, copy=False)
+            elif lbl.shape[2] == L:
+                labels_motor = _expand_link_label_to_motor(lbl.astype(np.float32, copy=False), L)
+            else:
+                raise ValueError(
+                    f"[{path.name}] Label last-dim {lbl.shape[2]} is neither L({L}) nor 8L({L*MOTORS_PER_LINK})."
+                )
+        else:
+            raise KeyError(
+                f"[{path.name}] Could not find label array. Expected one of {_LABEL_ALIASES}. "
+                f"Available keys: {keys}"
+            )
+
+    info = {"desired": d_key, "actual": a_key, "label": lbl_key}
+    return desired.astype(np.float32, copy=False), actual.astype(np.float32, copy=False), labels_motor, info
 
 def load_all_shards(
     paths: Sequence[Path],
     baseline_window: int,
     include_motor_features: bool,
     component_threshold_deg: float,
+    use_energy_tiebreak: bool,
 ) -> FeaturePack:
     node_buf: List[np.ndarray] = []
     link_buf: List[np.ndarray] = []
@@ -220,16 +385,20 @@ def load_all_shards(
 
     total = len(paths)
     for idx, path in enumerate(paths, 1):
-        with np.load(path) as data:
-            desired = data["desired_link_cum"]
-            actual  = data["actual_link_cum"]
-            labels  = data["label"]
+        try:
+            desired, actual, labels, resolved = load_shard_flex(path)
+            print(f"[data] processed shard {idx}/{total} ({path.name}) "
+                  f"→ keys(desired:{resolved['desired']}, actual:{resolved['actual']}, label:{resolved['label']})",
+                  flush=True)
+        except Exception:
+            raise
 
         pack = build_features(
             desired_cum=desired, actual_cum=actual, labels=labels,
             baseline_window=baseline_window,
             include_motor_features=include_motor_features,
             component_threshold_deg=component_threshold_deg,
+            use_energy_tiebreak=use_energy_tiebreak,
         )
         node_buf.append(pack.node_features)
         link_buf.append(pack.link_labels)
@@ -243,8 +412,6 @@ def load_all_shards(
                 raise ValueError("Inconsistent feature dim across shards.")
             if link_count != pack.link_count:
                 raise ValueError("Inconsistent link count across shards.")
-
-        print(f"[data] processed shard {idx}/{total}", flush=True)
 
     node_features = np.concatenate(node_buf, axis=0)
     link_labels   = np.concatenate(link_buf,  axis=0)
@@ -354,6 +521,38 @@ class SinusoidalPositionalEncoding(nn.Module):
         """returns (1, T, 1, D) slice for broadcasting"""
         return self.pe[:t_len].unsqueeze(0).unsqueeze(2)  # (1,T,1,D)
 
+# ============================ EMA helper ============================
+
+class EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self.backup: Dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.detach().clone()
+
+    def update(self, model: nn.Module):
+        d = self.decay
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name].mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    @contextmanager
+    def average_parameters(self, model: nn.Module):
+        try:
+            self.backup = {}
+            for name, p in model.named_parameters():
+                if name in self.shadow:
+                    self.backup[name] = p.detach().clone()
+                    p.data.copy_(self.shadow[name].data)
+            yield
+        finally:
+            for name, p in model.named_parameters():
+                if name in self.backup:
+                    p.data.copy_(self.backup[name].data)
+            self.backup = {}
+
 # ============================ Transformer Model ============================
 
 class TemporalLinkTransformer(nn.Module):
@@ -361,6 +560,7 @@ class TemporalLinkTransformer(nn.Module):
     Tokens = (time, link) pairs, plus [CLS].
     Output: link logits (B,L+1), motor logits (B,8L+1)
     OOM-safe: gradient checkpointing, SDPA kernel (new API) with fallback-to-noop
+    NEW: Attentive time pooling across the window for each link.
     """
     def __init__(
         self,
@@ -373,14 +573,20 @@ class TemporalLinkTransformer(nn.Module):
         link_count: int,
         use_checkpoint: bool = False,
         use_sdp: bool = True,
+        use_time_pool: bool = True,
     ) -> None:
         super().__init__()
         self.L = link_count
         self.d_model = d_model
         self.use_checkpoint = use_checkpoint
         self.use_sdp = use_sdp
+        self.use_time_pool = use_time_pool
 
-        self.in_proj = nn.Linear(feature_dim, d_model)
+        self.in_proj = nn.Sequential(
+            nn.Linear(feature_dim, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
         self.link_embed = nn.Embedding(link_count, d_model)
         self.posenc = SinusoidalPositionalEncoding(d_model)
 
@@ -394,6 +600,16 @@ class TemporalLinkTransformer(nn.Module):
 
         # Learned [CLS]
         self.cls = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
+        # Time pooling scorer (per token → scalar)
+        if use_time_pool:
+            self.time_score = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.Tanh(),
+                nn.Linear(d_model, 1)
+            )
+        else:
+            self.time_score = None
 
         # Heads
         self.link_node_head = nn.Sequential(
@@ -417,7 +633,6 @@ class TemporalLinkTransformer(nn.Module):
         self.motor_healthy_bias = nn.Parameter(torch.tensor(0.0))
 
     def _sdp_ctx(self):
-        # Prefer new API (PyTorch >= 2.5). If unavailable, no-op (avoid deprecated warnings).
         if not (self.use_sdp and torch.cuda.is_available()):
             return nullcontext()
         try:
@@ -432,7 +647,6 @@ class TemporalLinkTransformer(nn.Module):
         return nullcontext()
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, S, D)
         import torch.utils.checkpoint as cp
         with self._sdp_ctx():
             h = x
@@ -464,14 +678,20 @@ class TemporalLinkTransformer(nn.Module):
 
         h = self._encode(x)                            # (B, 1+TL, D)
         h_cls = h[:, 0]                                # (B,D)
-        start = 1 + (T - 1) * L
-        h_last = h[:, start : start + L]               # (B,L,D)
 
-        node_scores = self.link_node_head(h_last).squeeze(-1)        # (B,L)
-        healthy = self.link_healthy_head(h_cls).squeeze(-1)          # (B,)
+        tok = h[:, 1:].reshape(B, T, L, self.d_model)  # (B,T,L,D)
+        if self.use_time_pool and (T > 1):
+            scores = self.time_score(tok)              # (B,T,L,1)
+            attn = torch.softmax(scores, dim=1)
+            h_link = (attn * tok).sum(dim=1)           # (B,L,D)
+        else:
+            h_link = tok[:, -1]                        # (B,L,D)
+
+        node_scores = self.link_node_head(h_link).squeeze(-1)       # (B,L)
+        healthy = self.link_healthy_head(h_cls).squeeze(-1)         # (B,)
         link_logits = torch.cat([healthy.unsqueeze(-1), node_scores], dim=-1)  # (B,L+1)
 
-        cond = self.motor_cond_head(h_last)                          # (B,L,8)
+        cond = self.motor_cond_head(h_link)                          # (B,L,8)
         combined = cond + link_logits[:, 1:].unsqueeze(-1)           # (B,L,8)
         flat = combined.reshape(B, L * MOTORS_PER_LINK)              # (B,8L)
         m0 = link_logits[:, 0:1] + self.motor_healthy_bias           # (B,1)
@@ -506,15 +726,12 @@ def hard_mask_motor_logits(motor_logits: torch.Tensor, link_idx: torch.Tensor, L
     return torch.where(allowed, motor_logits, neg_large)
 
 def consistency_loss(link_logits: torch.Tensor, motor_logits: torch.Tensor, L: int) -> torch.Tensor:
-    """KL(link_from_motor || link_head) + healthy prob L1. AMP/FP16/FP32 안전."""
+    """KL(link_from_motor || link_head) + healthy prob L1. AMP/FP16/FP32 안전. (vectorized)"""
     if L == 0:
         return motor_logits.new_zeros(())
     B = motor_logits.size(0)
-    link_from_motor = motor_logits.new_empty(B, L)
-    for i in range(L):
-        s = 1 + i * MOTORS_PER_LINK
-        e = s + MOTORS_PER_LINK
-        link_from_motor[:, i] = torch.logsumexp(motor_logits[:, s:e], dim=1)
+    motors = motor_logits[:, 1:].reshape(B, L, MOTORS_PER_LINK)  # (B, L, 8)
+    link_from_motor = torch.logsumexp(motors, dim=2)              # (B, L)
     log_q = F.log_softmax(link_from_motor, dim=1)
     p     = F.softmax(link_logits[:, 1:], dim=1)
     kl = F.kl_div(log_q, p, reduction="batchmean")
@@ -522,8 +739,6 @@ def consistency_loss(link_logits: torch.Tensor, motor_logits: torch.Tensor, L: i
     m0 = F.softmax(motor_logits, dim=1)[:, 0]
     healthy_l1 = F.l1_loss(m0, p0)
     return kl + healthy_l1
-
-# ---- metrics helpers (macro/micro; with/without healthy=0) ----
 
 def _init_counts(C: int) -> Dict[str, np.ndarray]:
     return {"tp": np.zeros(C, dtype=np.int64),
@@ -569,16 +784,12 @@ def _compute_prf(counts: Dict[str, np.ndarray], exclude_zero: bool = False) -> D
 # ============================ LR scheduler builders ============================
 
 def build_noam_lambda(d_model: int, warmup_steps: int):
-    """
-    Noam schedule normalized so that factor == 1 at step = warmup_steps.
-    Then actual LR at warmup peak equals optimizer's base lr (args.lr).
-    """
     d_scale = d_model ** (-0.5)
-    peak = d_scale * (warmup_steps ** (-0.5))  # value at s = warmup
+    peak = d_scale * (warmup_steps ** (-0.5))
     peak = max(peak, 1e-12)
 
     def fn(step: int):
-        s = max(step, 1)  # avoid zero
+        s = max(step, 1)
         return (d_scale * min(s ** (-0.5), s * (warmup_steps ** (-1.5)))) / peak
     return fn
 
@@ -586,9 +797,6 @@ def build_scheduler(optimizer: torch.optim.Optimizer,
                     args: argparse.Namespace,
                     updates_per_epoch: int,
                     total_epochs: int):
-    """
-    Returns (scheduler, total_updates). Scheduler must be stepped after each optimizer.step().
-    """
     total_updates = max(updates_per_epoch * total_epochs, 1)
     warmup = int(args.warmup_steps)
 
@@ -612,12 +820,41 @@ def build_scheduler(optimizer: torch.optim.Optimizer,
         else:
             sched = sched2
             info = (f"[sched] Cosine(no warmup): total_updates={total_updates}, eta_min={args.min_lr}")
-    else:  # "cosine"
+    else:
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_updates, eta_min=args.min_lr)
         info = f"[sched] Cosine: total_updates={total_updates}, eta_min={args.min_lr}"
 
     print(info, flush=True)
     return sched, total_updates
+
+# ============================ Simple Augmentations ============================
+
+def apply_train_augmentation(x: torch.Tensor,
+                             time_mask_frac: float,
+                             feat_mask_frac: float,
+                             noise_std: float) -> torch.Tensor:
+    """
+    x: (B,T,L,F) float
+    Applies in-place style augmentations and returns x (same reference).
+    """
+    if time_mask_frac <= 0 and feat_mask_frac <= 0 and noise_std <= 0:
+        return x
+    B, T, L, F = x.shape
+    if time_mask_frac > 0:
+        k = max(int(T * time_mask_frac), 0)
+        if k > 0:
+            idx = torch.randint(0, T, (B, k), device=x.device)
+            b = torch.arange(B, device=x.device).unsqueeze(1)
+            x[b, idx, :, :] = 0
+    if feat_mask_frac > 0:
+        kf = max(int(F * feat_mask_frac), 0)
+        if kf > 0:
+            idx_f = torch.randint(0, F, (B, kf), device=x.device)
+            b = torch.arange(B, device=x.device).unsqueeze(1)
+            x[b, :, :, idx_f] = 0
+    if noise_std > 0:
+        x.add_(torch.randn_like(x) * noise_std)
+    return x
 
 # ============================ Train loop ============================
 
@@ -636,18 +873,17 @@ def run_epoch(
     accum_steps: int = 1,
     compute_metrics: bool = True,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    aug_time_mask: float = 0.0,
+    aug_feat_mask: float = 0.0,
+    aug_noise_std: float = 0.0,
+    ema: Optional[EMA] = None,
 ) -> Tuple[float, float, float, Dict[str, float]]:
     training = optimizer is not None
 
-    # autocast for CUDA when amp=True
     autocast_cm = torch.amp.autocast(device_type='cuda', dtype=torch.float16) if (amp and device.type == "cuda") else nullcontext()
-    # inference_mode for eval reduces mem/overhead
     outer_cm = torch.inference_mode if not training else nullcontext
 
-    if training:
-        model.train(True)
-    else:
-        model.train(False)
+    model.train(training)
 
     total_loss = 0.0
     total_link_correct = 0
@@ -671,6 +907,9 @@ def run_epoch(
             y_link = y_link.to(device, non_blocking=True)
             y_motor = y_motor.to(device, non_blocking=True)
 
+            if training and (aug_time_mask > 0 or aug_feat_mask > 0 or aug_noise_std > 0):
+                node_win = apply_train_augmentation(node_win, aug_time_mask, aug_feat_mask, aug_noise_std)
+
             with autocast_cm:
                 link_logits, motor_logits = model(node_win)
                 loss_link  = link_loss_fn(link_logits, y_link)
@@ -682,10 +921,12 @@ def run_epoch(
             bsz = y_link.size(0)
 
             if training:
-                (loss / accum_steps).backward()
-                if (step + 1) % accum_steps == 0:
+                (loss / max(accum_steps, 1)).backward()
+                if (step + 1) % max(accum_steps, 1) == 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
+                    if ema is not None:
+                        ema.update(model)  # ✅ per-step EMA update
                     optimizer.zero_grad(set_to_none=True)
                     if scheduler is not None:
                         scheduler.step()
@@ -702,8 +943,8 @@ def run_epoch(
             total_samples += bsz
 
             if compute_metrics:
-                _update_counts(link_counts, link_pred, y_link, C_link)
-                _update_counts(motor_counts, motor_pred, y_motor, C_motor)
+                _update_counts(link_counts, link_pred, y_link, link_count + 1)
+                _update_counts(motor_counts, motor_pred, y_motor, link_count * MOTORS_PER_LINK + 1)
 
     mean_loss = total_loss / max(total_samples, 1)
     link_acc  = total_link_correct / max(total_samples, 1)
@@ -729,55 +970,49 @@ def run_epoch(
 # ============================ CLI & main ============================
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Transformer FDI Trainer (accuracy-first, OOM-safe, with warmup)")
+    p = argparse.ArgumentParser(description="Transformer FDI Trainer (accuracy-first, OOM-safe, with warmup + robustness)")
     p.add_argument("--data-root", type=str, default="data_storage/link_3")
-    p.add_argument("--max-shards", type=int, default=0)
+    p.add_argument("--max-shards", type=int, default=0, help="[IGNORED] Kept for backward compat; all shards are always used.")
     p.add_argument("--baseline-window", type=int, default=120)
     p.add_argument("--include-motor-features", action="store_true", default=True)
     p.add_argument("--component-threshold-deg", type=float, default=18.0)
+    p.add_argument("--energy-tie-break", action="store_true", default=True, help="Pick faulty link with max energy if multiple.")
 
     p.add_argument("--window", type=int, default=96)
     p.add_argument("--pos-stride", type=int, default=3)
     p.add_argument("--neg-stride", type=int, default=12)
     p.add_argument("--val-ratio", type=float, default=0.2)
 
-    # Transformer size
     p.add_argument("--d-model", type=int, default=384)
     p.add_argument("--nhead", type=int, default=8)
     p.add_argument("--layers", type=int, default=6)
     p.add_argument("--ffn-size", type=int, default=1024)
-    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--dropout", type=float, default=0.2)
 
-    # Train
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--val-batch-size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--lr", type=float, default=2e-4, help="Base LR (also peak LR at warmup end for Noam & cosine_warmup).")
-    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=5e-3)
     p.add_argument("--accum-steps", type=int, default=1, help="Gradient accumulation steps.")
     p.add_argument("--motor-weight", type=float, default=1.0)
     p.add_argument("--label-smoothing-link", type=float, default=0.05)
     p.add_argument("--label-smoothing-motor", type=float, default=0.05)
 
-    # Consistency & eval mask
     p.add_argument("--consistency-weight", type=float, default=0.2)
     p.add_argument("--hard-mask-eval", action="store_true")
 
-    # OOM-safe toggles
     p.add_argument("--grad-checkpoint", action="store_true", help="Enable gradient checkpointing per Transformer layer.")
     p.add_argument("--no-sdp", action="store_true", help="Disable SDPA Flash/Mem-Efficient attention kernels.")
 
-    # Metrics control
     p.add_argument("--metrics-train", action="store_true", default=True, help="Compute and print train PR/REC/F1 each epoch.")
 
     p.add_argument("--seed", type=int, default=2024)
 
-    # Save paths
     p.add_argument("--save", type=str, default=None, help="Base path. If set, saves best_*.pt and last_*.pt in the same folder.")
     p.add_argument("--save-best", type=str, default=None, help="Explicit path for best checkpoint.")
     p.add_argument("--save-last", type=str, default=None, help="Explicit path for last checkpoint.")
 
-    # Engine
     p.add_argument("--amp", action="store_true", default=True, help="Use AMP in training.")
     p.add_argument("--eval-amp", action="store_true", default=True, help="Use AMP in evaluation.")
     p.add_argument("--compile", action="store_true", default=False)
@@ -785,17 +1020,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefetch-factor", type=int, default=2)
     p.add_argument("--persistent-workers", action="store_true", default=True)
 
-    # LR scheduler / warmup
     p.add_argument("--scheduler", type=str, choices=["noam", "cosine_warmup", "cosine"], default="noam",
                    help="Warmup/schedule type. 'noam' follows the Transformer paper.")
     p.add_argument("--warmup-steps", type=int, default=4000, help="Warmup steps (optimizer updates).")
     p.add_argument("--warmup-start-lr-factor", type=float, default=0.01,
                    help="For cosine_warmup: starting LR factor relative to base LR.")
     p.add_argument("--min-lr", type=float, default=0.0, help="Eta_min for cosine schedules.")
+
+    p.add_argument("--balanced-sampling", action="store_true", help="Use WeightedRandomSampler on link labels.")
+    p.add_argument("--aug-time-mask", type=float, default=0.1, help="Fraction of time frames to zero in training (0~0.5).")
+    p.add_argument("--aug-feat-mask", type=float, default=0.05, help="Fraction of feature dims to zero in training (0~0.5).")
+    p.add_argument("--aug-noise-std", type=float, default=0.01, help="Gaussian noise std on inputs during training.")
+    p.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay. <=0 to disable.")
+    p.add_argument("--no-time-pool", action="store_true", help="Disable attentive time pooling (use last step only).")
+
+    # NEW: caps and memory knob
+    p.add_argument("--samples-per-epoch", type=int, default=0,
+                   help="If >0, limit number of training windows drawn per epoch. With --balanced-sampling this is exact (replacement).")
+    p.add_argument("--max-windows-per-seq", type=int, default=0,
+                   help="If >0, cap training windows per sequence BEFORE building the loader (uniform random).")
+    p.add_argument("--no-pin-memory", action="store_true",
+                   help="Disable pinned memory for DataLoader (can reduce RAM pressure).")
+
     return p.parse_args()
 
 def _derive_save_paths(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
-    # Priority: explicit paths
     if args.save_best or args.save_last:
         return args.save_best, args.save_last
     if not args.save:
@@ -815,7 +1064,6 @@ def main() -> None:
                           "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"[device] {device}")
 
-    # TF32 (Ampere+)
     try:
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -825,15 +1073,16 @@ def main() -> None:
     shard_paths = discover_shards(args.data_root)
     if not shard_paths:
         raise FileNotFoundError(f"No shards found at {args.data_root}")
-    if args.max_shards > 0:
-        shard_paths = shard_paths[: args.max_shards]
     print(f"[data] found {len(shard_paths)} shards")
+    if getattr(args, "max_shards", 0):
+        print("[data] NOTE: --max-shards is ignored; using ALL shards discovered.", flush=True)
 
     pack = load_all_shards(
         shard_paths,
         baseline_window=args.baseline_window,
         include_motor_features=args.include_motor_features,
         component_threshold_deg=args.component_threshold_deg,
+        use_energy_tiebreak=args.energy_tie_break,
     )
     node_all = pack.node_features
     y_link_all  = pack.link_labels
@@ -842,7 +1091,6 @@ def main() -> None:
     F_node = node_all.shape[-1]
     print(f"[data] nodes {node_all.shape}, link_labels {y_link_all.shape}, motor_labels {y_motor_all.shape} | links={L}")
 
-    # Split by sequence
     rng = np.random.default_rng(args.seed)
     N = node_all.shape[0]
     perm = rng.permutation(N)
@@ -854,12 +1102,10 @@ def main() -> None:
     y_link_tr, y_link_val = y_link_all[tr_idx], y_link_all[val_idx]
     y_motor_tr, y_motor_val = y_motor_all[tr_idx], y_motor_all[val_idx]
 
-    # Normalize
     mean, std = compute_norm_stats(node_tr)
     normalize_inplace(node_tr, mean, std)
     normalize_inplace(node_val, mean, std)
 
-    # Datasets/loaders
     train_ds = FeatureWindowDataset(
         node_tr, y_link_tr, y_motor_tr,
         window=args.window, pos_stride=args.pos_stride, neg_stride=args.neg_stride
@@ -870,14 +1116,72 @@ def main() -> None:
     )
     print(f"[data] windows train={len(train_ds)} val={len(val_ds)}")
 
-    pin = device.type == "cuda"
+    # ------- Optional per-sequence subsampling BEFORE making the loader -------
+    from torch.utils.data import Subset
+    selected_idx = np.arange(len(train_ds))
+
+    if args.max_windows_per_seq and args.max_windows_per_seq > 0:
+        rng_local = np.random.default_rng(args.seed)
+        kept = []
+        # seq ids here refer to train split (0..node_tr.shape[0]-1)
+        for s in range(node_tr.shape[0]):
+            idxs = np.nonzero(train_ds.seq_idx == s)[0]
+            if len(idxs) > args.max_windows_per_seq:
+                idxs = rng_local.choice(idxs, size=args.max_windows_per_seq, replace=False)
+            kept.append(idxs)
+        selected_idx = np.sort(np.concatenate(kept))
+
+    train_ds_final: Dataset = train_ds if selected_idx.size == len(train_ds) else Subset(train_ds, selected_idx)
+
+    # labels view for sampler / class weights
+    if isinstance(train_ds_final, Subset):
+        base = train_ds_final.dataset
+        idxs = train_ds_final.indices
+        labels_for_sampler  = base.link_labels[idxs]
+        motors_for_sampler  = base.motor_labels[idxs]
+    else:
+        labels_for_sampler  = train_ds.link_labels
+        motors_for_sampler  = train_ds.motor_labels
+
+    # ----------------- Samplers / Loaders -----------------
+    pin = (device.type == "cuda") and (not args.no_pin_memory)
     nw = args.num_workers
     pf = args.prefetch_factor if nw and args.prefetch_factor > 0 else None
     pw = args.persistent_workers and (nw > 0)
 
+    if args.balanced_sampling:
+        num_link_classes = L + 1
+        counts = np.bincount(labels_for_sampler, minlength=num_link_classes)
+        counts[counts == 0] = 1
+        weights = 1.0 / counts[labels_for_sampler]
+        target_samples = int(args.samples_per_epoch) if args.samples_per_epoch and args.samples_per_epoch > 0 else len(labels_for_sampler)
+        sampler = WeightedRandomSampler(torch.as_tensor(weights, dtype=torch.double),
+                                        num_samples=target_samples, replacement=True)
+        shuffle_train = False
+    else:
+        # If not balanced, optionally cut the dataset down to samples-per-epoch once (no replacement)
+        if args.samples_per_epoch and args.samples_per_epoch > 0 and args.samples_per_epoch < len(labels_for_sampler):
+            rng_local = np.random.default_rng(args.seed)
+            if isinstance(train_ds_final, Subset):
+                idxs = np.array(train_ds_final.indices)
+                chosen = np.sort(rng_local.choice(np.arange(len(train_ds_final)), size=int(args.samples_per_epoch), replace=False))
+                train_ds_final = Subset(train_ds_final, chosen)
+                # refresh labels_for_sampler
+                base = train_ds_final.dataset
+                idxs = train_ds_final.indices
+                labels_for_sampler = base.link_labels[idxs]
+                motors_for_sampler = base.motor_labels[idxs]
+            else:
+                chosen = np.sort(rng_local.choice(np.arange(len(train_ds_final)), size=int(args.samples_per_epoch), replace=False))
+                train_ds_final = Subset(train_ds_final, chosen)
+                labels_for_sampler = train_ds.link_labels[chosen]
+                motors_for_sampler = train_ds.motor_labels[chosen]
+        sampler = None
+        shuffle_train = True
+
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False,
-        num_workers=nw, pin_memory=pin, persistent_workers=pw, prefetch_factor=pf
+        train_ds_final, batch_size=args.batch_size, shuffle=shuffle_train, drop_last=False,
+        num_workers=nw, pin_memory=pin, persistent_workers=pw, prefetch_factor=pf, sampler=sampler
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.val_batch_size, shuffle=False, drop_last=False,
@@ -895,6 +1199,7 @@ def main() -> None:
         link_count=L,
         use_checkpoint=args.grad_checkpoint,
         use_sdp=(not args.no_sdp),
+        use_time_pool=(not args.no_time_pool),
     ).to(device)
 
     if args.compile:
@@ -903,23 +1208,26 @@ def main() -> None:
         except Exception as e:
             print(f"[warn] torch.compile failed ({e}); fallback to eager.", flush=True)
 
-    # Losses & optimizer
     num_link_classes  = L + 1
     num_motor_classes = L * MOTORS_PER_LINK + 1
-    link_w  = compute_class_weights(train_ds.link_labels,  num_link_classes).to(device)
-    motor_w = compute_class_weights(train_ds.motor_labels, num_motor_classes).to(device)
+
+    # compute class weights on the ACTUAL training set used by the loader
+    link_w  = compute_class_weights(labels_for_sampler,  num_link_classes).to(device)
+    motor_w = compute_class_weights(motors_for_sampler, num_motor_classes).to(device)
 
     link_loss_fn = nn.CrossEntropyLoss(weight=link_w, label_smoothing=args.label_smoothing_link)
     motor_loss_fn = nn.CrossEntropyLoss(weight=motor_w, label_smoothing=args.label_smoothing_motor)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # ---- Build scheduler (per update) ----
+    # scheduler per update
     num_batches = len(train_loader)
-    updates_per_epoch = math.ceil(num_batches / max(args.accum-steps if hasattr(args, 'accum-steps') else args.accum_steps, 1))  # safeguard
-    # The above hasattr guard supports hyphenated/underscore mismatch; but parser uses 'accum_steps'.
     updates_per_epoch = math.ceil(num_batches / max(args.accum_steps, 1))
     scheduler, total_updates = build_scheduler(optimizer, args, updates_per_epoch, args.epochs)
+
+    # EMA
+    use_ema = args.ema_decay and args.ema_decay > 0
+    ema = EMA(model, decay=args.ema_decay) if use_ema else None
 
     best_metric = -1.0
     best_epoch = 0
@@ -932,24 +1240,39 @@ def main() -> None:
             hard_mask_eval=False, consistency_weight=args.consistency_weight,
             accum_steps=args.accum_steps, compute_metrics=args.metrics_train,
             scheduler=scheduler,
-        )
-        val_loss, val_link_acc, val_motor_acc, va_m = run_epoch(
-            model, val_loader, link_loss_fn, motor_loss_fn,
-            args.motor_weight, optimizer=None, device=device, amp=args.eval_amp, link_count=L,
-            hard_mask_eval=args.hard_mask_eval, consistency_weight=args.consistency_weight,
-            accum_steps=1, compute_metrics=True, scheduler=None,
+            aug_time_mask=max(0.0, min(args.aug_time_mask, 0.5)),
+            aug_feat_mask=max(0.0, min(args.aug_feat_mask, 0.5)),
+            aug_noise_std=max(0.0, args.aug_noise_std),
+            ema=ema,
         )
 
-        # Choose best by fault-only link macro F1
+        # ---- Evaluate (with EMA weights if enabled) ----
+        if use_ema:
+            with ema.average_parameters(model):
+                val_loss, val_link_acc, val_motor_acc, va_m = run_epoch(
+                    model, val_loader, link_loss_fn, motor_loss_fn,
+                    args.motor_weight, optimizer=None, device=device, amp=args.eval_amp, link_count=L,
+                    hard_mask_eval=args.hard_mask_eval, consistency_weight=args.consistency_weight,
+                    accum_steps=1, compute_metrics=True, scheduler=None,
+                )
+        else:
+            val_loss, val_link_acc, val_motor_acc, va_m = run_epoch(
+                model, val_loader, link_loss_fn, motor_loss_fn,
+                args.motor_weight, optimizer=None, device=device, amp=args.eval_amp, link_count=L,
+                hard_mask_eval=args.hard_mask_eval, consistency_weight=args.consistency_weight,
+                accum_steps=1, compute_metrics=True, scheduler=None,
+            )
+
         current_score = va_m["link_fault_macro_f1"]
 
         if current_score > best_metric:
             best_metric = current_score
             best_epoch = ep
             if best_path:
+                state_to_save = model.state_dict()
                 torch.save(
                     {
-                        "model_state": model.state_dict(),
+                        "model_state": state_to_save,
                         "node_mean": mean,
                         "node_std":  std,
                         "config": vars(args),
@@ -960,6 +1283,7 @@ def main() -> None:
                         "d_model": args.d_model,
                         "epoch": ep,
                         "metrics": va_m,
+                        "ema": (ema.shadow if use_ema else None),
                     },
                     best_path,
                 )
@@ -977,22 +1301,40 @@ def main() -> None:
                    f" | best L-fault-mF1={best_metric*100:5.2f}% (ep{best_epoch})")
         print(f"Epoch {ep:02d}/{args.epochs} | {tr_line}\n{va_line} | lr={curr_lr:.6g}")
 
-    # Save last
+    # Save last (EMA weights if enabled)
     if last_path:
-        torch.save(
-            {
-                "model_state": model.state_dict(),
-                "node_mean": mean,
-                "node_std":  std,
-                "config": vars(args),
-                "link_count": L,
-                "feature_dim": F_node,
-                "d_model": args.d_model,
-                "best_epoch": best_epoch,
-                "best_link_fault_macro_f1": float(best_metric),
-            },
-            last_path,
-        )
+        if use_ema:
+            with ema.average_parameters(model):
+                torch.save(
+                    {
+                        "model_state": model.state_dict(),
+                        "node_mean": mean,
+                        "node_std":  std,
+                        "config": vars(args),
+                        "link_count": L,
+                        "feature_dim": F_node,
+                        "d_model": args.d_model,
+                        "best_epoch": best_epoch,
+                        "best_link_fault_macro_f1": float(best_metric),
+                        "ema": ema.shadow,
+                    },
+                    last_path,
+                )
+        else:
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "node_mean": mean,
+                    "node_std":  std,
+                    "config": vars(args),
+                    "link_count": L,
+                    "feature_dim": F_node,
+                    "d_model": args.d_model,
+                    "best_epoch": best_epoch,
+                    "best_link_fault_macro_f1": float(best_metric),
+                },
+                last_path,
+            )
 
     print(f"[done] best fault-only link macro-F1 {best_metric*100:.2f}% at epoch {best_epoch}")
     if best_path:
@@ -1002,8 +1344,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
 """
 python3 transformer_fdi_train.py \
   --data-root data_storage/link_3 \
@@ -1013,13 +1353,17 @@ python3 transformer_fdi_train.py \
   --batch-size 96 --val-batch-size 96 \
   --include-motor-features \
   --consistency-weight 0.3 --hard-mask-eval \
-  --num-workers 12 --prefetch-factor 6 --persistent-workers \
+  --num-workers 4 --prefetch-factor 2 --persistent-workers \
   --amp --eval-amp \
-  --grad-checkpoint \
   --scheduler cosine_warmup \
   --warmup-steps 6000 \
   --warmup-start-lr-factor 0.01 \
   --min-lr 0.0 \
   --lr 2e-4 \
+  --balanced-sampling \
+  --aug-time-mask 0.12 --aug-feat-mask 0.05 --aug-noise-std 0.01 \
+  --ema-decay 0.999 \
+  --samples-per-epoch 3000 \
+  --max-windows-per-seq 60 \
   --save trans_fdi_big.pt
 """
